@@ -1,0 +1,6 @@
+{
+  "name": "NG-ILMF Mobile Command Center",
+  "description": "Future Generations Intelligent Minds Factory — Master Control Center for managing AI models, datasets, training bridges, quality control, and archival integrity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
