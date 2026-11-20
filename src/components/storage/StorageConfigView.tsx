@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { CheckSquare, Cpu, HardDrive, Save, ShieldCheck, Smartphone, Terminal } from 'lucide-react';
 import { t } from '../../i18n/translations';
 import type {
@@ -35,6 +35,7 @@ export function StorageConfigView({
   onUpdated,
 }: StorageConfigViewProps) {
   const copy = t(locale);
+  const isAr = locale === 'ar';
 
   const [selectedProvider, setSelectedProvider] = useState<StorageProviderId>(
     environment.selectedArchiveProvider,
@@ -60,6 +61,23 @@ export function StorageConfigView({
     environment.lastVerificationReport,
   );
 
+  useEffect(() => {
+    setSelectedProvider(environment.selectedArchiveProvider);
+    if (environment.lastVerificationReport) {
+      setActiveReport(environment.lastVerificationReport);
+    }
+    setFormState({
+      data_dir: config.data_dir ?? '',
+      sd_archive_path: config.sd_archive_path ?? '',
+      termux_prefix: config.termux_prefix ?? '',
+      termux_shared_path: config.termux_shared_path ?? '',
+      android_saf_uri: config.android_saf_uri ?? '',
+      target_device_model: config.target_device_model ?? '',
+      android_version: config.android_version ?? '',
+      bridge_endpoint: config.bridge_endpoint ?? '',
+    });
+  }, [config, environment]);
+
   const handleSave = async (e: FormEvent) => {
     e.preventDefault();
     setSaving(true);
@@ -76,6 +94,26 @@ export function StorageConfigView({
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'Save failed',
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSelectProvider = async (providerId: StorageProviderId) => {
+    setSelectedProvider(providerId);
+    setFeedback(null);
+    if (providerId === environment.selectedArchiveProvider) {
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateRuntimeConfig({ selected_archive_provider: providerId });
+      await onUpdated();
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to switch provider',
       });
     } finally {
       setSaving(false);
@@ -237,14 +275,21 @@ export function StorageConfigView({
               <div className="pt-2 border-t border-[#523624]/15 flex flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
-                  onClick={() => setSelectedProvider(card.id)}
+                  disabled={saving}
+                  onClick={() => void handleSelectProvider(card.id)}
                   className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
                     isSelected
                       ? 'bg-[#26170F] text-[#F3D989]'
                       : 'bg-[#3B2419]/10 text-[#3B2419] hover:bg-[#3B2419]/20'
                   }`}
                 >
-                  {isSelected ? 'Selected Provider' : 'Select Provider'}
+                  {isSelected
+                    ? isAr
+                      ? 'المزود المحدد'
+                      : 'Selected Provider'
+                    : isAr
+                      ? 'تحديد المزود'
+                      : 'Select Provider'}
                 </button>
 
                 <button

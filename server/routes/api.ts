@@ -40,6 +40,58 @@ import {
   resetDemoSession,
   runIsolatedDemoInference,
 } from '../services/demoService.ts';
+import {
+  archiveResourceToSmartArchive,
+  deleteResourceSafely,
+  generateDataFactoryManifest,
+  getResourceLibraryIntegrityStatus,
+  listArchiveEntries,
+  listResources,
+  processAndBuildDatasetPackage,
+  registerResource,
+  startBackgroundResourceIntegrityCheck,
+  verifyArchiveIntegrityBatch,
+  verifyResourceIntegrity,
+  type ArchiveCategoryFolder,
+  type LibrarySection,
+} from '../services/dataFactoryService.ts';
+import {
+  createIndependentMind,
+  createTrainingJob,
+  getScalePlanningMatrix,
+  getTrainingJobLogs,
+  intakeExternalModel,
+  listTrainingJobs,
+  listWorkers,
+  prepareTransferManifest,
+  probeWorkerConnection,
+  recordJobTelemetry,
+  registerWorker,
+  restoreTrainingCheckpoint,
+  saveTrainingCheckpoint,
+  updateTrainingJobControl,
+  type ModelScaleTier,
+  type TrainingJobRecord,
+} from '../services/mindFactoryService.ts';
+import {
+  collectPerformanceMetrics,
+  collectTrainingMetrics,
+  getRealtimeSyncService,
+} from '../services/realtimeSyncService.ts';
+import {
+  listModelProducts,
+  receiveExternalModelForRepair,
+  registerOrRepairProduct,
+  transitionProductLifecycle,
+  type ModelLifecycleState,
+  type NgProductClass,
+} from '../services/repairRegistryService.ts';
+import { listQcReports, runTenSuiteQcCheck } from '../services/trustQcService.ts';
+import {
+  buildCertifiedDeliveryPackage,
+  listDeliveryPackages,
+  verifyDeliveryPackageIntegrity,
+} from '../services/ngIpService.ts';
 
 function readOwnerToken(req: express.Request): string | undefined {
   const token = req.header('x-ng-owner-token');
@@ -75,6 +127,34 @@ export function createApiRouter() {
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to load dashboard state',
+      });
+    }
+  });
+
+  // --- REAL-TIME DATA SYNCHRONIZATION SERVICE ENDPOINTS ---
+  router.get('/sync/stream', (req, res) => {
+    const db = getDatabase();
+    void getRealtimeSyncService().subscribeSseClient(req, res, db);
+  });
+
+  router.get('/sync/metrics', (_req, res) => {
+    const db = getDatabase();
+    const syncService = getRealtimeSyncService();
+    res.json({
+      performanceMetrics: collectPerformanceMetrics(),
+      trainingMetrics: collectTrainingMetrics(db),
+      syncMetadata: syncService.getMetadata(),
+    });
+  });
+
+  router.post('/sync/refresh', async (_req, res) => {
+    try {
+      const db = getDatabase();
+      const result = await getRealtimeSyncService().syncAndBroadcast(db, 'manual-sync');
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to synchronize live metrics',
       });
     }
   });
@@ -203,6 +283,8 @@ export function createApiRouter() {
         hostDevState: hostReport.state,
       },
     });
+
+    void getRealtimeSyncService().broadcastSnapshot(db, 'storage-verification');
 
     res.json({
       outcome,
@@ -598,6 +680,632 @@ export function createApiRouter() {
     const db = getDatabase();
     const result = resetDemoSession(db);
     res.json(result);
+  });
+
+  // --- WING 1: DATA FACTORY (Resources & Smart Archive) ---
+  router.get('/wings/data/resources', (req, res) => {
+    const db = getDatabase();
+    const section = typeof req.query.section === 'string' ? req.query.section : 'ALL';
+    const search = typeof req.query.search === 'string' ? req.query.search : '';
+    const resources = listResources(db, { section, search });
+    const archiveEntries = listArchiveEntries(db);
+    res.json({ resources, archiveEntries });
+  });
+
+  router.get('/wings/data/resources/integrity', (_req, res) => {
+    const db = getDatabase();
+    res.json(getResourceLibraryIntegrityStatus(db));
+  });
+
+  router.post('/wings/data/resources/check-integrity', (_req, res) => {
+    try {
+      const db = getDatabase();
+      const result = startBackgroundResourceIntegrityCheck(db, () => {
+        void getRealtimeSyncService().broadcastSnapshot(db, 'resource-library-integrity-checked');
+      });
+      res.status(result.started ? 202 : 200).json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to start integrity verification',
+      });
+    }
+  });
+
+  router.post('/wings/data/resources', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        librarySection?: LibrarySection;
+        name?: string;
+        resourceType?: string;
+        originSource?: string;
+        license?: string;
+        filePath?: string;
+        contentText?: string;
+        contentBase64?: string;
+        originalFileName?: string;
+        version?: string;
+        dependencies?: string[];
+        transferable?: boolean;
+      };
+      const result = registerResource(db, {
+        librarySection: body.librarySection ?? 'DATASET',
+        name: body.name ?? '',
+        resourceType: body.resourceType ?? '',
+        originSource: body.originSource ?? '',
+        license: body.license ?? '',
+        filePath: body.filePath,
+        contentText: body.contentText,
+        contentBase64: body.contentBase64,
+        originalFileName: body.originalFileName,
+        version: body.version,
+        dependencies: body.dependencies,
+        transferable: body.transferable,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'resource-registered');
+      res.status(result.deduplicated ? 200 : 201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to register resource' });
+    }
+  });
+
+  router.post('/wings/data/dataset-package', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        datasetName?: string;
+        license?: string;
+        originSource?: string;
+        version?: string;
+        sourceResourceIds?: string[];
+        rawFiles?: Array<{ fileName: string; contentText?: string; contentBase64?: string }>;
+        stripHtml?: boolean;
+        deduplicateLines?: boolean;
+        minLineLength?: number;
+        format?: 'JSONL' | 'TXT';
+      };
+      const result = processAndBuildDatasetPackage(db, {
+        datasetName: body.datasetName ?? '',
+        license: body.license ?? '',
+        originSource: body.originSource ?? 'DATA_FACTORY_PIPELINE',
+        version: body.version,
+        sourceResourceIds: body.sourceResourceIds,
+        rawFiles: body.rawFiles,
+        stripHtml: body.stripHtml,
+        deduplicateLines: body.deduplicateLines,
+        minLineLength: body.minLineLength,
+        format: body.format,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'dataset-package-built');
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Dataset pipeline failed' });
+    }
+  });
+
+  router.post('/wings/data/resources/:id/verify', (req, res) => {
+    try {
+      const db = getDatabase();
+      const resource = verifyResourceIntegrity(db, req.params.id);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'resource-verified');
+      res.json({ resource });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Resource verify failed' });
+    }
+  });
+
+  router.delete('/wings/data/resources/:id', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'delete', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+      const result = deleteResourceSafely(db, req.params.id);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'resource-deleted');
+      res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Delete failed';
+      res.status(msg.startsWith('Blocked:') ? 409 : 400).json({ error: msg });
+    }
+  });
+
+  router.post('/wings/data/archive', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        resourceId?: string;
+        categoryFolder?: ArchiveCategoryFolder;
+      };
+      const entry = archiveResourceToSmartArchive(db, {
+        resourceId: body.resourceId ?? '',
+        categoryFolder: body.categoryFolder ?? 'DATASETS',
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'resource-archived');
+      res.status(201).json({ entry });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Archive operation failed' });
+    }
+  });
+
+  router.post('/wings/data/archive/verify', (_req, res) => {
+    try {
+      const db = getDatabase();
+      const summary = verifyArchiveIntegrityBatch(db);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'archive-batch-verified');
+      res.json(summary);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Archive verify failed' });
+    }
+  });
+
+  router.post('/wings/data/manifest', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+      const manifest = generateDataFactoryManifest(db);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'data-manifest-generated');
+      res.json({ manifest });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Manifest generation failed' });
+    }
+  });
+
+  // --- WING 2: NEW MIND FACTORY (Intake, Workers/Bridge, Scaling 1B-30B+, Jobs) ---
+  router.get('/wings/mind/overview', (_req, res) => {
+    const db = getDatabase();
+    res.json({
+      workers: listWorkers(db),
+      jobs: listTrainingJobs(db),
+      scaleMatrix: getScalePlanningMatrix(),
+    });
+  });
+
+  router.post('/wings/mind/workers', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'pairing', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+      const body = (req.body ?? {}) as {
+        workerName?: string;
+        endpointUrl?: string;
+        gpuModel?: string;
+        vramGb?: number;
+        systemRamGb?: number;
+        maxSupportedScale?: ModelScaleTier;
+        authSecret?: string;
+      };
+      const worker = registerWorker(db, {
+        workerName: body.workerName ?? '',
+        endpointUrl: body.endpointUrl ?? '',
+        gpuModel: body.gpuModel ?? '',
+        vramGb: Number(body.vramGb ?? 0),
+        systemRamGb: Number(body.systemRamGb ?? 0),
+        maxSupportedScale: body.maxSupportedScale,
+        authSecret: body.authSecret,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'worker-registered');
+      res.status(201).json({ worker });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Worker registration failed' });
+    }
+  });
+
+  router.post('/wings/mind/workers/:id/probe', async (req, res) => {
+    try {
+      const db = getDatabase();
+      const result = await probeWorkerConnection(db, req.params.id);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'worker-probed');
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Worker probe failed' });
+    }
+  });
+
+  router.post('/wings/mind/transfer-manifest', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+      const body = (req.body ?? {}) as {
+        resourceId?: string;
+        workerId?: string;
+        chunkSizeBytes?: number;
+      };
+      const manifest = prepareTransferManifest(db, {
+        resourceId: body.resourceId ?? '',
+        workerId: body.workerId ?? '',
+        chunkSizeBytes: body.chunkSizeBytes,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'transfer-manifest-prepared');
+      res.json({ manifest });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Transfer prep failed' });
+    }
+  });
+
+  router.post('/wings/mind/create', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        name?: string;
+        productClass?: NgProductClass;
+        version?: string;
+        scaleTier?: ModelScaleTier;
+        architecture?: string;
+        tokenizerSpec?: string;
+        license?: string;
+        baseDatasetId?: string;
+        seedConfigJson?: string;
+      };
+      const created = createIndependentMind(db, {
+        name: body.name ?? '',
+        productClass: body.productClass,
+        version: body.version ?? '1.0.0',
+        scaleTier: body.scaleTier ?? '1B',
+        architecture: body.architecture ?? '',
+        tokenizerSpec: body.tokenizerSpec ?? 'BPE-32K',
+        license: body.license ?? '',
+        baseDatasetId: body.baseDatasetId,
+        seedConfigJson: body.seedConfigJson,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'independent-mind-created');
+      res.status(201).json(created);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create independent Mind' });
+    }
+  });
+
+  router.post('/wings/mind/intake', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        name?: string;
+        productClass?: NgProductClass;
+        version?: string;
+        architectureSummary?: string;
+        scaleTier?: ModelScaleTier;
+        license?: string;
+        weightsPath?: string;
+        tokenizerSpec?: string;
+        originSource?: string;
+      };
+      const result = intakeExternalModel(db, {
+        name: body.name ?? '',
+        productClass: body.productClass,
+        version: body.version ?? '1.0.0',
+        architectureSummary: body.architectureSummary ?? '',
+        scaleTier: body.scaleTier ?? '1B',
+        license: body.license ?? '',
+        weightsPath: body.weightsPath,
+        tokenizerSpec: body.tokenizerSpec,
+        originSource: body.originSource ?? 'EXTERNAL_INTAKE',
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'model-intake');
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Model intake failed' });
+    }
+  });
+
+  router.post('/wings/mind/jobs', async (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        modelId?: string;
+        datasetId?: string;
+        workerId?: string;
+        architecture?: string;
+        scaleTier?: ModelScaleTier;
+        totalSteps?: number;
+        learningRate?: string;
+        dispatchToWorker?: boolean;
+      };
+      const result = await createTrainingJob(db, {
+        modelId: body.modelId ?? '',
+        datasetId: body.datasetId ?? '',
+        workerId: body.workerId ?? '',
+        architecture: body.architecture ?? '',
+        scaleTier: body.scaleTier ?? '1B',
+        totalSteps: Number(body.totalSteps ?? 100),
+        learningRate: body.learningRate,
+        dispatchToWorker: Boolean(body.dispatchToWorker),
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'training-job-created');
+      res.status(201).json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Training job creation failed';
+      res.status(msg.startsWith('Blocked:') ? 422 : 400).json({ error: msg });
+    }
+  });
+
+  router.post('/wings/mind/jobs/:id/control', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as { action?: string };
+      if (body.action !== 'PAUSE' && body.action !== 'RESUME' && body.action !== 'CANCEL') {
+        res.status(400).json({ error: 'action must be PAUSE, RESUME, or CANCEL' });
+        return;
+      }
+      const job = updateTrainingJobControl(db, req.params.id, body.action);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'training-job-controlled');
+      res.json({ job });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Job control failed' });
+    }
+  });
+
+  router.post('/wings/mind/jobs/:id/telemetry', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        currentStep?: number;
+        totalSteps?: number;
+        trainingLoss?: number | null;
+        validationLoss?: number | null;
+        checkpointPath?: string | null;
+        jobStatus?: TrainingJobRecord['jobStatus'];
+      };
+      const job = recordJobTelemetry(db, req.params.id, body);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'training-job-telemetry');
+      res.json({ job });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Job telemetry update failed' });
+    }
+  });
+
+  router.post('/wings/mind/jobs/:id/checkpoint', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        step?: number;
+        trainingLoss?: number | null;
+        validationLoss?: number | null;
+        checkpointNotes?: string;
+        jobStatus?: TrainingJobRecord['jobStatus'];
+      };
+      const saved = saveTrainingCheckpoint(db, {
+        jobId: req.params.id,
+        step: Number(body.step ?? 0),
+        trainingLoss: body.trainingLoss,
+        validationLoss: body.validationLoss,
+        checkpointNotes: body.checkpointNotes,
+        jobStatus: body.jobStatus,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'training-checkpoint-saved');
+      res.status(201).json(saved);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to save checkpoint' });
+    }
+  });
+
+  router.post('/wings/mind/jobs/:id/restore', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as { checkpointPath?: string };
+      const restored = restoreTrainingCheckpoint(db, req.params.id, body.checkpointPath ?? '');
+      void getRealtimeSyncService().broadcastSnapshot(db, 'training-checkpoint-restored');
+      res.json(restored);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to restore checkpoint' });
+    }
+  });
+
+  router.get('/wings/mind/jobs/:id/logs', (req, res) => {
+    try {
+      const db = getDatabase();
+      const logs = getTrainingJobLogs(db, req.params.id);
+      res.json(logs);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to read job logs' });
+    }
+  });
+
+  // --- WING 3: MIND REPAIR & RE-ENGINEERING FACTORY (Product Registry & Lifecycle) ---
+  router.get('/wings/repair/products', (_req, res) => {
+    const db = getDatabase();
+    res.json({ products: listModelProducts(db) });
+  });
+
+  router.post('/wings/repair/intake', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        name?: string;
+        version?: string;
+        originSource?: string;
+        license?: string;
+        architectureSummary?: string;
+        weightsPath?: string;
+        fileName?: string;
+        fileBase64?: string;
+        contentText?: string;
+      };
+      const intake = receiveExternalModelForRepair(db, {
+        name: body.name ?? '',
+        version: body.version ?? '1.0.0',
+        originSource: body.originSource ?? 'EXTERNAL_REPAIR_INTAKE',
+        license: body.license ?? '',
+        architectureSummary: body.architectureSummary ?? '',
+        weightsPath: body.weightsPath,
+        fileName: body.fileName,
+        fileBase64: body.fileBase64,
+        contentText: body.contentText,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'repair-external-intake');
+      res.status(201).json(intake);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'External model intake failed' });
+    }
+  });
+
+  router.post('/wings/repair/products', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        id?: string;
+        name?: string;
+        productClass?: NgProductClass;
+        version?: string;
+        weightsSha256?: string;
+        architectureSummary?: string;
+        trainingSummary?: string;
+        evaluationSummary?: string;
+        license?: string;
+        safetyNotes?: string;
+        restoreCheckpointPath?: string;
+        changelog?: string;
+      };
+      const product = registerOrRepairProduct(db, {
+        id: body.id,
+        name: body.name ?? '',
+        productClass: body.productClass ?? 'NG-REPAIRED',
+        version: body.version ?? '1.0.0',
+        weightsSha256: body.weightsSha256 ?? '',
+        architectureSummary: body.architectureSummary ?? '',
+        trainingSummary: body.trainingSummary,
+        evaluationSummary: body.evaluationSummary,
+        license: body.license ?? '',
+        safetyNotes: body.safetyNotes,
+        restoreCheckpointPath: body.restoreCheckpointPath,
+        changelog: body.changelog,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'repair-product-saved');
+      res.status(body.id ? 200 : 201).json({ product });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Product registry save failed' });
+    }
+  });
+
+  router.put('/wings/repair/products/:id/state', (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as { nextState?: ModelLifecycleState };
+      const product = transitionProductLifecycle(
+        db,
+        req.params.id,
+        body.nextState ?? 'EVALUATION',
+      );
+      void getRealtimeSyncService().broadcastSnapshot(db, 'product-lifecycle-changed');
+      res.json({ product });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Lifecycle transition failed';
+      res.status(msg.startsWith('Blocked:') ? 422 : 400).json({ error: msg });
+    }
+  });
+
+  // --- WING 4: TRUST & SECURITY CENTER (10-Suite QC Verification) ---
+  router.get('/wings/trust/qc', (req, res) => {
+    const db = getDatabase();
+    const productId = typeof req.query.productId === 'string' ? req.query.productId : undefined;
+    res.json({ reports: listQcReports(db, productId) });
+  });
+
+  router.post('/wings/trust/qc/:productId/run', (req, res) => {
+    try {
+      const db = getDatabase();
+      const summary = runTenSuiteQcCheck(db, req.params.productId);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'qc-verification-run');
+      res.json(summary);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'QC run failed' });
+    }
+  });
+
+  // --- WING 5: NG-IP SERVICES (Certified Delivery ZIPs & Technical Dossiers) ---
+  router.get('/wings/ngip/packages', (_req, res) => {
+    const db = getDatabase();
+    res.json({ packages: listDeliveryPackages(db) });
+  });
+
+  router.post('/wings/ngip/packages/:productId/build', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+      const body = (req.body ?? {}) as { ipHolder?: string; licenseTermsNote?: string };
+      const deliveryPackage = buildCertifiedDeliveryPackage(db, req.params.productId, {
+        ipHolder: body.ipHolder,
+        licenseTermsNote: body.licenseTermsNote,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'delivery-package-built');
+      res.status(201).json({ deliveryPackage });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Delivery build failed';
+      res.status(msg.startsWith('Blocked:') ? 422 : 400).json({ error: msg });
+    }
+  });
+
+  router.post('/wings/ngip/packages/:id/verify', (req, res) => {
+    try {
+      const db = getDatabase();
+      const result = verifyDeliveryPackageIntegrity(db, req.params.id);
+      void getRealtimeSyncService().broadcastSnapshot(db, 'delivery-package-verified');
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Delivery package verification failed' });
+    }
+  });
+
+  router.get('/wings/ngip/packages/:id/download', (req, res) => {
+    try {
+      const db = getDatabase();
+      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
+      if (!auth.allowed) {
+        res.status(403).json({ error: auth.reason });
+        return;
+      }
+
+      const pkg = listDeliveryPackages(db).find((p) => p.id === req.params.id);
+      if (!pkg) {
+        res.status(404).json({ error: 'Delivery package not found' });
+        return;
+      }
+
+      const config = getConfigMap(db);
+      const dataDir = path.resolve(config.data_dir || process.cwd());
+      const resolvedZip = path.resolve(pkg.zipPath);
+      if (!resolvedZip.startsWith(`${dataDir}${path.sep}`)) {
+        res.status(403).json({ error: 'Blocked: Delivery package path outside workspace' });
+        return;
+      }
+      if (!fs.existsSync(resolvedZip) || !fs.statSync(resolvedZip).isFile()) {
+        res.status(404).json({ error: 'Certified delivery ZIP missing on disk' });
+        return;
+      }
+
+      recordAuditEvent(db, {
+        actor: 'OWNER',
+        category: 'NG_IP',
+        action: 'DOWNLOAD_CERTIFIED_DELIVERY_ZIP',
+        target: pkg.id,
+        outcome: 'PASS',
+        details: { zipPath: resolvedZip, sizeBytes: pkg.sizeBytes },
+      });
+
+      const fileName = path.basename(resolvedZip);
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.sendFile(resolvedZip);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Delivery package download failed',
+      });
+    }
   });
 
   return router;

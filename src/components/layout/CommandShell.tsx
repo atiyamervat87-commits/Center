@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import {
-  Activity,
+  Cpu,
   FolderGit2,
   HardDrive,
   LayoutDashboard,
@@ -12,6 +12,7 @@ import type { Locale } from '../../types/commandCenter';
 
 export type NavTabId =
   | 'dashboard'
+  | 'wings'
   | 'projects'
   | 'storage'
   | 'device'
@@ -44,10 +45,10 @@ export function CommandShell({
 
   const navItems: Array<{ id: NavTabId; label: string; icon: typeof LayoutDashboard }> = [
     { id: 'dashboard', label: copy.navDashboard, icon: LayoutDashboard },
+    { id: 'wings', label: copy.navWings, icon: Cpu },
     { id: 'projects', label: copy.navProjects, icon: FolderGit2 },
     { id: 'storage', label: copy.navStorage, icon: HardDrive },
     { id: 'device', label: copy.navDeviceSec, icon: Shield },
-    { id: 'audit', label: copy.navAudit, icon: Activity },
   ];
 
   return (

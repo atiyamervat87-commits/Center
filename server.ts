@@ -4,6 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import { getDatabase } from './server/db/database.ts';
 import { recordAuditEvent } from './server/audit/auditService.ts';
 import { createApiRouter } from './server/routes/api.ts';
+import { getRealtimeSyncService } from './server/services/realtimeSyncService.ts';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -23,8 +24,12 @@ async function startServer() {
     },
   });
 
+  // Start background real-time metrics synchronization loop for subscribed clients
+  const syncService = getRealtimeSyncService();
+  syncService.start(db, 5000);
+
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '16mb' }));
 
   // Mount API routes
   app.use('/api/v1', createApiRouter());
@@ -43,9 +48,16 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`NG-ILMF Command Center listening on http://0.0.0.0:${PORT}`);
   });
+
+  const shutdown = () => {
+    syncService.stop();
+    server.close();
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 startServer().catch((err) => {

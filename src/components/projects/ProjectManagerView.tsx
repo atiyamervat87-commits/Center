@@ -120,6 +120,7 @@ export function ProjectManagerView({ locale, onDataChanged }: ProjectManagerView
       setEditNotes(res.project.notes);
       setExportedReport(null);
       setActionMessage(null);
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load project details');
     }
@@ -202,6 +203,7 @@ export function ProjectManagerView({ locale, onDataChanged }: ProjectManagerView
 
   const handleLinkResource = async () => {
     if (!selectedDetail || !linkResourceId) return;
+    setError(null);
     try {
       const res = await linkProjectResource(selectedDetail.id, linkResourceId);
       setSelectedDetail(res.project);
@@ -214,6 +216,7 @@ export function ProjectManagerView({ locale, onDataChanged }: ProjectManagerView
 
   const handleUnlinkResource = async (resourceId: string) => {
     if (!selectedDetail) return;
+    setError(null);
     try {
       const res = await unlinkProjectResource(selectedDetail.id, resourceId);
       setSelectedDetail(res.project);
@@ -226,6 +229,7 @@ export function ProjectManagerView({ locale, onDataChanged }: ProjectManagerView
 
   const handleExportReport = async () => {
     if (!selectedDetail) return;
+    setError(null);
     try {
       const res = await exportProjectReport(selectedDetail.id);
       setExportedReport(res.report);
@@ -682,33 +686,47 @@ export function ProjectManagerView({ locale, onDataChanged }: ProjectManagerView
                   </div>
                 )}
 
-                {independentResources.length === 0 ? (
-                  <p className="text-xs text-[#523624]/90">{copy.pmNoLibraryResourcesHint}</p>
-                ) : (
-                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1">
-                    <select
-                      value={linkResourceId}
-                      onChange={(e) => setLinkResourceId(e.target.value)}
-                      className="flex-1 min-h-[42px] px-3 py-1.5 rounded-lg bg-[#FFF8E8] border border-[#523624]/25 text-xs font-mono"
-                    >
-                      <option value="">{copy.pmLinkResourceLabel}</option>
-                      {independentResources.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.name} ({r.librarySection} · v{r.version})
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      disabled={!linkResourceId}
-                      onClick={() => void handleLinkResource()}
-                      className="min-h-[42px] px-4 py-2 rounded-lg bg-[#3B2419] text-[#F3D989] disabled:opacity-50 text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                    >
-                      <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>{copy.pmLinkResourceBtn}</span>
-                    </button>
-                  </div>
-                )}
+                {(() => {
+                  const linkedIds = new Set(selectedDetail.linkedResources.map((r) => r.id));
+                  const linkable = independentResources.filter((r) => !linkedIds.has(r.id));
+                  if (independentResources.length === 0) {
+                    return <p className="text-xs text-[#523624]/90">{copy.pmNoLibraryResourcesHint}</p>;
+                  }
+                  if (linkable.length === 0) {
+                    return (
+                      <p className="text-xs text-[#523624]/90">
+                        {locale === 'ar'
+                          ? 'جميع الموارد المسجلة في المكتبة مرتبطة حاليًا بهذا المشروع.'
+                          : 'All registered library resources are already linked to this project.'}
+                      </p>
+                    );
+                  }
+                  return (
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1">
+                      <select
+                        value={linkResourceId}
+                        onChange={(e) => setLinkResourceId(e.target.value)}
+                        className="flex-1 min-h-[42px] px-3 py-1.5 rounded-lg bg-[#FFF8E8] border border-[#523624]/25 text-xs font-mono"
+                      >
+                        <option value="">{copy.pmLinkResourceLabel}</option>
+                        {linkable.map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {r.name} ({r.librarySection} · v{r.version})
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={!linkResourceId}
+                        onClick={() => void handleLinkResource()}
+                        className="min-h-[42px] px-4 py-2 rounded-lg bg-[#3B2419] text-[#F3D989] disabled:opacity-50 text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>{copy.pmLinkResourceBtn}</span>
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           )}

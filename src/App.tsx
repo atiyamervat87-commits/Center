@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { t } from './i18n/translations';
 import {
   fetchDashboardSnapshot,
   verifyStorageProbe,
 } from './services/apiClient';
-import type { Locale, MasterDashboardSnapshot } from './types/commandCenter';
+import {
+  RealtimeDashboardSyncClient,
+  type RealtimeSyncClientStatus,
+} from './services/realtimeSyncClient';
+import type { Locale, MasterDashboardSnapshot, WingId } from './types/commandCenter';
 import { CommandShell, type NavTabId } from './components/layout/CommandShell';
 import { MasterDashboard } from './components/dashboard/MasterDashboard';
+import { FactoryWingsView } from './components/wings/FactoryWingsView';
 import { ProjectManagerView } from './components/projects/ProjectManagerView';
 import { StorageConfigView } from './components/storage/StorageConfigView';
 import { DeviceSecurityView } from './components/device/DeviceSecurityView';
@@ -17,11 +22,22 @@ import { ModuleRoadmapView } from './components/modules/ModuleRoadmapView';
 export default function App() {
   const [locale, setLocale] = useState<Locale>('ar');
   const [activeTab, setActiveTab] = useState<NavTabId>('dashboard');
+  const [activeWing, setActiveWing] = useState<WingId>('DATA_FACTORY');
   const [demoMode, setDemoMode] = useState(false);
   const [snapshot, setSnapshot] = useState<MasterDashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<RealtimeSyncClientStatus>({
+    connectionState: 'DISCONNECTED',
+    transport: 'SSE',
+    sequence: 0,
+    lastSyncedAt: null,
+    lastReason: null,
+    error: null,
+  });
+  const syncClientRef = useRef<RealtimeDashboardSyncClient | null>(null);
 
   const copy = t(locale);
 
@@ -46,6 +62,50 @@ export default function App() {
     void loadSnapshot();
   }, [loadSnapshot]);
 
+  useEffect(() => {
+    if (demoMode) {
+      syncClientRef.current?.stop();
+      return;
+    }
+
+    const client = syncClientRef.current ?? new RealtimeDashboardSyncClient();
+    syncClientRef.current = client;
+
+    const unsubStatus = client.onStatusChange((nextStatus) => {
+      setSyncStatus(nextStatus);
+    });
+    const unsubSnapshot = client.onSnapshot((syncedSnapshot) => {
+      setSnapshot(syncedSnapshot);
+      setError(null);
+      setLoading(false);
+    });
+
+    client.start();
+
+    return () => {
+      unsubSnapshot();
+      unsubStatus();
+      client.stop();
+    };
+  }, [demoMode]);
+
+  const handleManualSync = async () => {
+    setIsSyncing(true);
+    try {
+      if (syncClientRef.current) {
+        const updated = await syncClientRef.current.syncNow();
+        setSnapshot(updated);
+      } else {
+        await loadSnapshot();
+      }
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy.errorLoading);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const handleRunSystemCheck = async () => {
     setChecking(true);
     try {
@@ -56,6 +116,11 @@ export default function App() {
     } finally {
       setChecking(false);
     }
+  };
+
+  const handleOpenWing = (wing: WingId) => {
+    setActiveWing(wing);
+    setActiveTab('wings');
   };
 
   return (
@@ -103,12 +168,37 @@ export default function App() {
         </div>
       ) : snapshot ? (
         <>
+          {error && (
+            <div className="mb-4 rounded-xl bg-red-50 border border-red-800/30 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-red-900">
+              <span className="font-mono break-all">{error}</span>
+              <button
+                type="button"
+                onClick={() => setError(null)}
+                className="min-h-[32px] px-3 py-1 rounded-md border border-red-800/30 bg-white hover:bg-red-100 text-red-900 font-semibold cursor-pointer shrink-0"
+              >
+                {locale === 'ar' ? 'إغلاق' : 'Dismiss'}
+              </button>
+            </div>
+          )}
           {activeTab === 'dashboard' && (
             <MasterDashboard
               locale={locale}
               onToggleLocale={() => setLocale((prev) => (prev === 'ar' ? 'en' : 'ar'))}
               snapshot={snapshot}
+              syncStatus={syncStatus}
+              isSyncing={isSyncing}
+              onSyncNow={handleManualSync}
               onNavigate={setActiveTab}
+              onOpenWing={handleOpenWing}
+            />
+          )}
+
+          {activeTab === 'wings' && (
+            <FactoryWingsView
+              locale={locale}
+              initialWing={activeWing}
+              onNavigate={setActiveTab}
+              onDataChanged={loadSnapshot}
             />
           )}
 

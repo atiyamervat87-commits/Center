@@ -162,12 +162,113 @@ export interface MasterDashboardSnapshot {
     registeredWorkers: number;
     errorEvents: number;
   };
+  wingsSummary?: {
+    dataFactory: {
+      status: SystemState;
+      totalResources: number;
+      verifiedResources: number;
+      archiveEntries: number;
+      storageReady: boolean;
+    };
+    newMindFactory: {
+      status: SystemState;
+      registeredWorkers: number;
+      onlineWorkers: number;
+      activeJobs: number;
+      queuedJobs: number;
+      importedModels: number;
+    };
+    mindRepairFactory: {
+      status: SystemState;
+      totalProducts: number;
+      evaluationProducts: number;
+      repairedProducts: number;
+      approvedProducts: number;
+    };
+    trustSecurityCenter: {
+      status: SystemState;
+      qcReportsTotal: number;
+      qcPassedTotal: number;
+      ownerLockConfigured: boolean;
+      activeSessions: number;
+    };
+    ngIpServices: {
+      status: SystemState;
+      releasedProducts: number;
+      deliveryPackages: number;
+      verifiedPackages: number;
+    };
+  };
+  performanceMetrics?: PerformanceMetricsSnapshot;
+  trainingMetrics?: TrainingMetricsSnapshot;
+  syncMetadata?: RealtimeSyncMetadata;
   environment: SeparatedEnvironmentProbe;
   androidDiagnostics: AndroidBridgeDiagnostics;
   config: Record<string, string>;
   recentAuditLogs: AuditLogEntry[];
   modules: ArchitectureModuleInfo[];
 }
+
+export interface PerformanceMetricsSnapshot {
+  collectedAt: string;
+  hostCpuPercent: number;
+  loadAvg1m: number;
+  loadAvg5m: number;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
+  memoryUsedPercent: number;
+  processRssBytes: number;
+  processHeapUsedBytes: number;
+  uptimeSeconds: number;
+  sqliteDbBytes: number;
+}
+
+export interface TrainingJobMetricSummary {
+  id: string;
+  modelId: string;
+  workerId: string;
+  architecture: string;
+  scaleTier: ModelScaleTier;
+  jobStatus:
+    | 'QUEUED'
+    | 'TRANSFERRING'
+    | 'RUNNING'
+    | 'PAUSED'
+    | 'COMPLETED'
+    | 'FAILED'
+    | 'CANCELLED';
+  currentStep: number;
+  totalSteps: number;
+  progressPercent: number | null;
+  trainingLoss: number | null;
+  validationLoss: number | null;
+  startedAt: string | null;
+}
+
+export interface TrainingMetricsSnapshot {
+  collectedAt: string;
+  totalWorkers: number;
+  onlineWorkers: number;
+  queuedJobs: number;
+  runningJobs: number;
+  pausedJobs: number;
+  completedJobs: number;
+  failedJobs: number;
+  jobs: TrainingJobMetricSummary[];
+}
+
+export interface RealtimeSyncMetadata {
+  syncTransport: 'SSE' | 'POLL_FALLBACK';
+  connectedClients: number;
+  lastSyncAt: string;
+  sequence: number;
+}
+
+export type RealtimeSyncConnectionState =
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'RECONNECTING'
+  | 'DISCONNECTED';
 
 export interface AndroidBridgeDiagnostics {
   flags: {
@@ -404,5 +505,288 @@ export interface DemoCatalogSnapshot {
     archiveAccessBlocked: true;
     settingsModificationBlocked: true;
   };
+}
+
+// --- FIVE PRODUCTION WINGS (Phases 2B - 7) ---
+export type WingId =
+  | 'DATA_FACTORY'
+  | 'NEW_MIND_FACTORY'
+  | 'MIND_REPAIR_FACTORY'
+  | 'TRUST_SECURITY_CENTER'
+  | 'NG_IP_SERVICES';
+
+export type LibrarySection = 'MODEL' | 'DATASET' | 'SOFTWARE' | 'KNOWLEDGE';
+export type ArchiveCategoryFolder =
+  | 'INVENTORY'
+  | 'LIBRARIES'
+  | 'AI_MODELS'
+  | 'DATASETS'
+  | 'CHECKPOINTS'
+  | 'BUILD_TOOLS'
+  | 'CONFIGURATIONS'
+  | 'RESTORE_PACKAGES'
+  | 'MANIFESTS';
+
+export interface ResourceRecord {
+  id: string;
+  librarySection: LibrarySection;
+  name: string;
+  resourceType: string;
+  originSource: string;
+  license: string;
+  filePath: string;
+  sizeBytes: number;
+  version: string;
+  sha256: string;
+  verificationStatus: 'VERIFIED' | 'UNVERIFIED' | 'FAILED' | 'QUARANTINED';
+  dependencies: string[];
+  transferable: boolean;
+  linkedProjectCount: number;
+  importedAt: string;
+  updatedAt: string;
+}
+
+export interface ArchiveEntryRecord {
+  id: string;
+  resourceId: string | null;
+  categoryFolder: ArchiveCategoryFolder;
+  archivePath: string;
+  sourcePath: string;
+  sha256: string;
+  sizeBytes: number;
+  verifyStatus: 'VERIFIED' | 'MISSING' | 'MISMATCH' | 'PENDING';
+  lastVerifiedAt: string | null;
+  archivedAt: string;
+}
+
+export type ModelScaleTier = '1B' | '3B' | '7B' | '13B' | '30B+';
+
+export interface ScaleResourceProfile {
+  scaleTier: ModelScaleTier;
+  parametersBillions: number;
+  fp16WeightsGb: number;
+  loraTrainMinVramGb: number;
+  fullTrainMinVramGb: number;
+  quantizedInt4InferenceGb: number;
+  recommendedSystemRamGb: number;
+}
+
+export interface TrainingWorkerRecord {
+  id: string;
+  workerName: string;
+  endpointUrl: string;
+  pairingFingerprint: string;
+  status: SystemState;
+  lastHeartbeatAt: string | null;
+  capabilities: {
+    gpuModel: string;
+    vramGb: number;
+    systemRamGb: number;
+    maxSupportedScale: ModelScaleTier;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TrainingJobRecord {
+  id: string;
+  modelId: string;
+  datasetId: string;
+  workerId: string;
+  architecture: string;
+  scaleTier: ModelScaleTier;
+  config: Record<string, unknown>;
+  jobStatus:
+    | 'QUEUED'
+    | 'TRANSFERRING'
+    | 'RUNNING'
+    | 'PAUSED'
+    | 'COMPLETED'
+    | 'FAILED'
+    | 'CANCELLED';
+  currentStep: number;
+  totalSteps: number;
+  trainingLoss: number | null;
+  validationLoss: number | null;
+  checkpointPath: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
+}
+
+export type NgProductClass =
+  | 'NG-BASE'
+  | 'NG-DOMAIN'
+  | 'NG-ADAPTED'
+  | 'NG-REPAIRED'
+  | 'NG-REENGINEERED'
+  | 'NG-QUANTIZED'
+  | 'NG-SECURED'
+  | 'NG-SOFTWARE';
+
+export type ModelLifecycleState =
+  | 'IMPORTED'
+  | 'INSPECTED'
+  | 'READY_FOR_TRAINING'
+  | 'TRAINING'
+  | 'EVALUATION'
+  | 'FAILED'
+  | 'APPROVED'
+  | 'RELEASED'
+  | 'ARCHIVED';
+
+export interface ModelProductRecord {
+  id: string;
+  name: string;
+  productClass: NgProductClass;
+  version: string;
+  weightsSha256: string;
+  architectureSummary: string;
+  trainingSummary: string;
+  evaluationSummary: string;
+  license: string;
+  runtimeRequirements: Record<string, unknown>;
+  safetyReport: Record<string, unknown>;
+  changelog: string;
+  lifecycleState: ModelLifecycleState;
+  qcPassedCount: number;
+  qcTotalCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QcSuiteReportRow {
+  id: string;
+  productId: string;
+  testSuite: string;
+  result: 'PASS' | 'FAIL' | 'BLOCKED' | 'PARTIAL' | 'NOT TESTED';
+  details: Record<string, unknown>;
+  executedAt: string;
+}
+
+export interface DeliveryPackageRecord {
+  id: string;
+  productId: string;
+  zipPath: string;
+  manifestSha256: string;
+  packageSha256: string;
+  sizeBytes: number;
+  verified: boolean;
+  createdAt: string;
+}
+
+export interface DatasetPackageBuildResult {
+  resource: ResourceRecord;
+  packageDir: string;
+  dataFilePath: string;
+  dataFileSha256: string;
+  manifestPath: string;
+  manifestSha256: string;
+  stats: {
+    inputSourcesCount: number;
+    rawLinesCount: number;
+    cleanedLinesCount: number;
+    droppedShortOrEmpty: number;
+    deduplicatedCount: number;
+    outputBytes: number;
+  };
+}
+
+export interface ArchiveBatchVerifyResult {
+  totalChecked: number;
+  verifiedCount: number;
+  mismatchCount: number;
+  missingCount: number;
+  entries: ArchiveEntryRecord[];
+}
+
+export interface IndependentMindCreateResult {
+  productId: string;
+  resourceId: string;
+  mindDir: string;
+  weightsManifestPath: string;
+  weightsSha256: string;
+}
+
+export interface TrainingCheckpointSaveResult {
+  job: TrainingJobRecord;
+  checkpointPath: string;
+  checkpointSha256: string;
+  resultsLogPath: string;
+}
+
+export interface TrainingCheckpointRestoreResult {
+  job: TrainingJobRecord;
+  verifiedSha256: string;
+  restoredStep: number;
+}
+
+export interface TrainingJobLogsResult {
+  jobId: string;
+  entries: Array<Record<string, unknown>>;
+  checkpoints: string[];
+}
+
+export interface RepairExternalIntakeResult {
+  product: ModelProductRecord;
+  originalBackupPath: string;
+  originalSha256: string;
+  inspectionReport: {
+    sha256Valid: boolean;
+    sizeBytes: number;
+    licenseCompliant: boolean;
+    warnings: string[];
+  };
+}
+
+export interface TrustQcRunResult {
+  productId: string;
+  passedCount: number;
+  totalCount: number;
+  allPassed: boolean;
+  evidencePath: string;
+  evidenceSha256: string;
+  reports: QcSuiteReportRow[];
+}
+
+export interface DeliveryPackageVerifyResult {
+  deliveryPackage: DeliveryPackageRecord;
+  fileExists: boolean;
+  validPkzipHeader: boolean;
+  sha256Matched: boolean;
+  actualSha256: string;
+}
+
+export type ResourceLibraryHealthStatus = 'HEALTHY' | 'CORRUPTED';
+
+export interface ResourceIntegrityItem {
+  id: string;
+  name: string;
+  librarySection: LibrarySection;
+  verificationStatus: 'VERIFIED' | 'UNVERIFIED' | 'FAILED' | 'QUARANTINED';
+  sha256: string;
+  sizeBytes: number;
+  filePath: string;
+  updatedAt: string;
+}
+
+export interface ResourceLibraryIntegrityStatus {
+  overallStatus: ResourceLibraryHealthStatus;
+  totalResources: number;
+  verifiedCount: number;
+  corruptedCount: number;
+  unverifiedCount: number;
+  totalBytes: number;
+  running: boolean;
+  checkedCount: number;
+  checkTotalCount: number;
+  startedAt: string | null;
+  lastCheckedAt: string | null;
+  resources: ResourceIntegrityItem[];
+}
+
+export interface StartIntegrityCheckResponse {
+  started: boolean;
+  status: ResourceLibraryIntegrityStatus;
 }
 

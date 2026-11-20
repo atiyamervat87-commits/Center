@@ -49,6 +49,7 @@ export function DeviceSecurityView({
   onDataChanged,
 }: DeviceSecurityViewProps) {
   const copy = t(locale);
+  const isAr = locale === 'ar';
 
   const [device, setDevice] = useState<DeviceManagerSnapshot | null>(null);
   const [security, setSecurity] = useState<SecuritySnapshot | null>(null);
@@ -425,7 +426,7 @@ export function DeviceSecurityView({
                   onClick={() => setShowDeps((v) => !v)}
                   className="text-xs font-semibold underline decoration-[#B8860B] text-[#3B2419] cursor-pointer"
                 >
-                  {showDeps ? 'Hide' : 'Inspect'}
+                  {showDeps ? (isAr ? 'إخفاء' : 'Hide') : (isAr ? 'عرض' : 'Inspect')}
                 </button>
               </div>
               {showDeps && (
@@ -543,10 +544,23 @@ export function DeviceSecurityView({
 
             <div className="flex items-center gap-3 font-mono text-xs font-bold">
               {security.sessionAuthenticated ? (
-                <span className="inline-flex items-center gap-1.5 text-emerald-800">
-                  <UserCheck className="h-4 w-4" aria-hidden="true" />
-                  <span>SESSION AUTHENTICATED ({security.activeSessionId})</span>
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-emerald-800">
+                    <UserCheck className="h-4 w-4" aria-hidden="true" />
+                    <span>SESSION AUTHENTICATED ({security.activeSessionId})</span>
+                  </span>
+                  {security.activeSessionId && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void handleRevokeSession(security.activeSessionId!, true)
+                      }
+                      className="px-2.5 py-1 rounded border border-[#523624]/30 hover:bg-[#523624]/10 text-[#26170F] font-sans font-semibold cursor-pointer"
+                    >
+                      {isAr ? 'قفل الجلسة' : 'Lock Session'}
+                    </button>
+                  )}
+                </div>
               ) : (
                 <span className="inline-flex items-center gap-1.5 text-amber-800">
                   <ShieldAlert className="h-4 w-4" aria-hidden="true" />
@@ -615,11 +629,19 @@ export function DeviceSecurityView({
             {/* Permission Controls */}
             <div className="rounded-xl bg-[#FFF8E8] border border-[#523624]/20 p-4 space-y-3">
               <h3 className="text-sm font-bold text-[#26170F]">{copy.secPermissionsTitle}</h3>
+              {security.ownerLockConfigured && !security.sessionAuthenticated && (
+                <p className="text-[11px] font-mono text-amber-800">
+                  {isAr
+                    ? 'سجّل الدخول بمفتاح المالك لتعديل ضوابط الصلاحيات.'
+                    : 'Sign in with owner passkey to modify permission controls.'}
+                </p>
+              )}
 
               <label className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-white border border-[#523624]/15 text-xs cursor-pointer">
                 <span className="font-medium text-[#26170F]">{copy.secPermExport}</span>
                 <input
                   type="checkbox"
+                  disabled={security.ownerLockConfigured && !security.sessionAuthenticated}
                   checked={security.permissions.exportRequiresAuth}
                   onChange={(e) =>
                     void handleTogglePermission('exportRequiresAuth', e.target.checked)
@@ -632,6 +654,7 @@ export function DeviceSecurityView({
                 <span className="font-medium text-[#26170F]">{copy.secPermDelete}</span>
                 <input
                   type="checkbox"
+                  disabled={security.ownerLockConfigured && !security.sessionAuthenticated}
                   checked={security.permissions.deleteRequiresAuth}
                   onChange={(e) =>
                     void handleTogglePermission('deleteRequiresAuth', e.target.checked)
@@ -644,6 +667,7 @@ export function DeviceSecurityView({
                 <span className="font-medium text-[#26170F]">{copy.secPermPairing}</span>
                 <input
                   type="checkbox"
+                  disabled={security.ownerLockConfigured && !security.sessionAuthenticated}
                   checked={security.permissions.pairingRequiresAuth}
                   onChange={(e) =>
                     void handleTogglePermission('pairingRequiresAuth', e.target.checked)

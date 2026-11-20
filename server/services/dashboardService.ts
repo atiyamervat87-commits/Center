@@ -3,6 +3,11 @@ import { getConfigMap } from '../db/database.ts';
 import { listAuditLogs } from '../audit/auditService.ts';
 import { probeDeviceEnvironment } from '../storage/storageProbe.ts';
 import { computeAndroidBridgeDiagnostics } from '../storage/androidBridgeDiagnostic.ts';
+import {
+  collectPerformanceMetrics,
+  collectTrainingMetrics,
+  getRealtimeSyncService,
+} from './realtimeSyncService.ts';
 
 export type SystemState =
   | 'ONLINE'
@@ -112,56 +117,56 @@ export function getArchitectureModules(): ArchitectureModuleStatus[] {
     {
       phase: 'PHASE 2B',
       id: 'resources-archive',
-      nameEn: 'Resource Library & Smart Archive',
-      nameAr: 'مكتبة الموارد والأرشيف الذكي',
-      status: 'PLANNED',
-      descriptionEn: 'Independent resource registry with SHA-256 deduplication and SD Card archive manifests.',
-      descriptionAr: 'سجل الموارد المستقل ببصمة SHA-256 ونظام أرشفة بطاقة SD وفهارس CSV/MD.',
+      nameEn: 'DATA FACTORY — Resource Library & Smart Archive',
+      nameAr: 'جناح البيانات — مكتبة الموارد والأرشيف الذكي',
+      status: 'ACTIVE',
+      descriptionEn: 'Independent resource registry with SHA-256 deduplication, integrity verification, and gated Smart Archive manifests.',
+      descriptionAr: 'سجل الموارد المستقل ببصمة SHA-256، التحقق من السلامة، ونظام الأرشفة الذكية المقيد بجاهزية الوسيط.',
     },
     {
       phase: 'PHASE 3',
       id: 'model-intake',
-      nameEn: 'Model Intake Center',
-      nameAr: 'مركز استقبال النماذج الخارجية',
-      status: 'PLANNED',
-      descriptionEn: 'ZIP/directory validation, architecture inspection, weight format & tokenizer checks.',
-      descriptionAr: 'استيراد وفحص سلامة الأوزان والمعمارية وتوافق Tokenizer وتقرير الاستقبال.',
+      nameEn: 'NEW MIND FACTORY — Model Intake Center',
+      nameAr: 'مصنع العقول الجديدة — مركز استقبال النماذج',
+      status: 'ACTIVE',
+      descriptionEn: 'Model registration, weights SHA-256 inspection, tokenizer/architecture checks, and license recording.',
+      descriptionAr: 'استقبال النماذج وفحص بصمة الأوزان والمعمارية والتوافق وتوثيق التراخيص.',
     },
     {
       phase: 'PHASE 4',
       id: 'computer-bridge',
-      nameEn: 'Computer Training Bridge',
-      nameAr: 'جسر اتصال كمبيوتر التدريب',
-      status: 'PLANNED',
-      descriptionEn: 'Authenticated Wi-Fi pairing, chunked resumable transfer, SHA-256 verification.',
-      descriptionAr: 'إقران آمن عبر الشبكة المحلية، نقل الأجزاء واستكمال الانقطاع والتحقق بالبصمة.',
+      nameEn: 'NEW MIND FACTORY — Computer Training Bridge',
+      nameAr: 'مصنع العقول الجديدة — جسر كمبيوتر التدريب',
+      status: 'ACTIVE',
+      descriptionEn: 'Real HTTP worker health probing, GPU/VRAM scaling checks (1B–30B+), and SHA-256 chunked transfer manifests.',
+      descriptionAr: 'فحص اتصال HTTP الحقيقي بالعمال، تخطيط سعة 1B–30B+، وتجهيز حزم النقل ببصمة SHA-256.',
     },
     {
       phase: 'PHASE 5',
       id: 'training-jobs',
-      nameEn: 'Training Job Manager',
-      nameAr: 'مدير مهام التدريب',
-      status: 'PLANNED',
-      descriptionEn: 'Job submission, real worker telemetry, checkpoint tracking, pause/resume.',
-      descriptionAr: 'إرسال المهام ومراقبة التقدم الفعلي من العامل وسجلات الخسارة ونقاط الاستعادة.',
+      nameEn: 'NEW MIND FACTORY — Training Job Manager',
+      nameAr: 'مصنع العقول الجديدة — إدارة مهام التدريب',
+      status: 'ACTIVE',
+      descriptionEn: 'Capacity-validated job queuing, real worker HTTP dispatch, pause/cancel controls, zero fake telemetry.',
+      descriptionAr: 'تجهيز وإرسال المهام وفق سعة VRAM الفعلية، وإيقاف/إلغاء آمن دون أي نسب تقدم وهمية.',
     },
     {
       phase: 'PHASE 6',
       id: 'product-registry',
-      nameEn: 'Model Library & Product Registry',
-      nameAr: 'سجل العقول والمنتجات المعتمدة',
-      status: 'PLANNED',
-      descriptionEn: 'NG-BASE to NG-SOFTWARE product lifecycle enforcement before approval.',
-      descriptionAr: 'تصنيفات المنتجات وحالات الاعتماد الصارمة قبل الإصدار.',
+      nameEn: 'MIND REPAIR & RE-ENG — Product Registry',
+      nameAr: 'مصنع الإصلاح وإعادة الهندسة — سجل الأجيال والمنتجات',
+      status: 'ACTIVE',
+      descriptionEn: 'NG-BASE to NG-SOFTWARE lifecycle state machine blocking approval/release until all 10 QC suites pass.',
+      descriptionAr: 'تصنيفات NG-* وإدارة الإصدارات ونقاط الاستعادة مع منع الاعتماد قبل اجتياز اختبارات الجودة.',
     },
     {
       phase: 'PHASE 7',
       id: 'qc-delivery',
-      nameEn: 'Quality Control & Customer Delivery Center',
-      nameAr: 'مركز الجودة وتسليم المنتجات للعملاء',
-      status: 'PLANNED',
-      descriptionEn: '10-suite QC verification and verified ZIP delivery package builder.',
-      descriptionAr: 'اختبارات الجودة العشرة وبناء حزم التسليم ZIP الموثقة ببصمة SHA-256.',
+      nameEn: 'TRUST & NG-IP — 10-Suite QC & Certified Delivery',
+      nameAr: 'مركز الثقة وNG-IP — الجودة العشرية وحزم التسليم',
+      status: 'ACTIVE',
+      descriptionEn: '10-suite QC verification, license compliance checks, and SHA-256 verified ZIP delivery package builder.',
+      descriptionAr: 'فحوصات الجودة العشرة والتحقق من التراخيص وبناء حزم تسليم ZIP موثقة ببصمة SHA-256.',
     },
     {
       phase: 'PHASE 8',
@@ -286,6 +291,78 @@ export async function getMasterDashboardSnapshot(db: DatabaseSync) {
     externalTrainingEnvStatus = bridgeProbe.status;
   }
 
+  const verifiedResourcesCount = countScalar(
+    "SELECT COUNT(*) AS count FROM resources WHERE verification_status = 'VERIFIED'",
+  );
+  const onlineWorkersCount = countScalar(
+    "SELECT COUNT(*) AS count FROM training_workers WHERE status = 'ONLINE'",
+  );
+  const queuedJobsCount = countScalar(
+    "SELECT COUNT(*) AS count FROM training_jobs WHERE job_status = 'QUEUED'",
+  );
+  const evaluationProductsCount = countScalar(
+    "SELECT COUNT(*) AS count FROM model_products WHERE lifecycle_state IN ('INSPECTED', 'EVALUATION')",
+  );
+  const repairedProductsCount = countScalar(
+    "SELECT COUNT(*) AS count FROM model_products WHERE product_class IN ('NG-REPAIRED', 'NG-REENGINEERED')",
+  );
+  const releasedProductsCount = countScalar(
+    "SELECT COUNT(*) AS count FROM model_products WHERE lifecycle_state = 'RELEASED'",
+  );
+  const qcReportsTotal = countScalar('SELECT COUNT(*) AS count FROM qc_reports');
+  const qcPassedTotal = countScalar(
+    "SELECT COUNT(*) AS count FROM qc_reports WHERE result = 'PASS'",
+  );
+  const deliveryPackagesCount = countScalar('SELECT COUNT(*) AS count FROM delivery_packages');
+  const verifiedDeliveryPackagesCount = countScalar(
+    'SELECT COUNT(*) AS count FROM delivery_packages WHERE verified = 1',
+  );
+  const activeSessionsCount = countScalar(
+    'SELECT COUNT(*) AS count FROM owner_sessions WHERE revoked = 0',
+  );
+
+  const wingsSummary = {
+    dataFactory: {
+      status: (storageReady ? 'READY' : totalResourcesCount > 0 ? 'WARNING' : 'ONLINE') as SystemState,
+      totalResources: totalResourcesCount,
+      verifiedResources: verifiedResourcesCount,
+      archiveEntries: archiveEntriesCount,
+      storageReady,
+    },
+    newMindFactory: {
+      status: (onlineWorkersCount > 0 ? 'ONLINE' : workersCount > 0 ? 'WARNING' : 'READY') as SystemState,
+      registeredWorkers: workersCount,
+      onlineWorkers: onlineWorkersCount,
+      activeJobs: activeJobsCount,
+      queuedJobs: queuedJobsCount,
+      importedModels: importedModelsCount,
+    },
+    mindRepairFactory: {
+      status: (totalProductsCount > 0 ? 'READY' : 'ONLINE') as SystemState,
+      totalProducts: totalProductsCount,
+      evaluationProducts: evaluationProductsCount,
+      repairedProducts: repairedProductsCount,
+      approvedProducts: approvedBrainsCount,
+    },
+    trustSecurityCenter: {
+      status: (config.owner_passkey_hash ? 'ONLINE' : 'WARNING') as SystemState,
+      qcReportsTotal,
+      qcPassedTotal,
+      ownerLockConfigured: Boolean(config.owner_passkey_hash),
+      activeSessions: activeSessionsCount,
+    },
+    ngIpServices: {
+      status: (verifiedDeliveryPackagesCount > 0 ? 'READY' : 'ONLINE') as SystemState,
+      releasedProducts: releasedProductsCount,
+      deliveryPackages: deliveryPackagesCount,
+      verifiedPackages: verifiedDeliveryPackagesCount,
+    },
+  };
+
+  const performanceMetrics = collectPerformanceMetrics();
+  const trainingMetrics = collectTrainingMetrics(db);
+  const syncMetadata = getRealtimeSyncService().getMetadata();
+
   return {
     generatedAt: new Date().toISOString(),
     factoryStatus,
@@ -307,6 +384,10 @@ export async function getMasterDashboardSnapshot(db: DatabaseSync) {
       registeredWorkers: workersCount,
       errorEvents: errorAuditCount,
     },
+    wingsSummary,
+    performanceMetrics,
+    trainingMetrics,
+    syncMetadata,
     environment,
     androidDiagnostics,
     config,
