@@ -122,6 +122,15 @@ function inspectPosixPath(targetPath: string): {
   };
 }
 
+export function normalizeArchiveRootPath(baseOrArchivePath: string): string {
+  const resolved = path.resolve(baseOrArchivePath.trim());
+  const baseName = path.basename(resolved);
+  if (baseName.toUpperCase() === 'NG-ILMF_ARCHIVE') {
+    return resolved;
+  }
+  return path.join(resolved, 'NG-ILMF_ARCHIVE');
+}
+
 function executeRealWriteReadSha256Test(
   probeResult: StorageProviderProbeResult,
   targetDirectory: string,
@@ -183,6 +192,15 @@ function executeRealWriteReadSha256Test(
   try {
     readBuffer = fs.readFileSync(testFilePath);
   } catch (err) {
+    let cleanupCompleted = false;
+    try {
+      if (fs.existsSync(testFilePath)) {
+        fs.unlinkSync(testFilePath);
+      }
+      cleanupCompleted = !fs.existsSync(testFilePath);
+    } catch {
+      cleanupCompleted = false;
+    }
     return {
       providerId: probeResult.providerId,
       environmentType: probeResult.environmentType,
@@ -196,7 +214,7 @@ function executeRealWriteReadSha256Test(
       expectedSha256,
       actualSha256: null,
       contentMatched: false,
-      cleanupCompleted: false,
+      cleanupCompleted,
       failureReason: err instanceof Error ? err.message : 'Failed to read back temporary probe file',
       executedAt,
     };

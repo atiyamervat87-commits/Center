@@ -102,8 +102,9 @@ test('Device Manager scans cleanup candidates without auto-deleting and protects
 test('Owner Security uses salted scrypt passkey, enforces permissions, and revokes sessions cleanly', () => {
   const { db, dir } = setupTempDb();
   try {
-    // Initially unlocked before passkey setup
-    assert.equal(isAuthorizedForAction(db, 'export', undefined).allowed, true);
+    // Sensitive actions BEFORE Owner Lock setup MUST be blocked
+    assert.equal(isAuthorizedForAction(db, 'export', undefined).allowed, false);
+    assert.equal(isAuthorizedForAction(db, 'mutate', undefined).allowed, false);
 
     const setup = setupOwnerPasskey(db, {
       passkey: 'Royal-Factory-Key-2026',
@@ -137,14 +138,15 @@ test('Owner Security uses salted scrypt passkey, enforces permissions, and revok
     revokeOwnerSession(db, secondLogin.sessionId, setup.sessionToken);
     assert.equal(isAuthorizedForAction(db, 'delete', secondLogin.sessionToken).allowed, false);
 
-    // Updating permissions works with active owner token
+    // Updating permissions works with active owner token, and authenticated sessions stay enforced
     const permUpdated = updateSecurityPermissions(
       db,
       { exportRequiresAuth: false },
       setup.sessionToken,
     );
     assert.equal(permUpdated.permissions.exportRequiresAuth, false);
-    assert.equal(isAuthorizedForAction(db, 'export', undefined).allowed, true);
+    assert.equal(isAuthorizedForAction(db, 'export', undefined).allowed, false);
+    assert.equal(isAuthorizedForAction(db, 'export', setup.sessionToken).allowed, true);
   } finally {
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });

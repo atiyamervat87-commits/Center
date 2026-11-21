@@ -45,20 +45,14 @@ import type {
 } from '../types/commandCenter';
 
 const API_BASE = '/api/v1';
-const OWNER_TOKEN_KEY = 'ng_ilmf_owner_token';
+let inMemoryOwnerToken = '';
 
 export function getOwnerToken(): string {
-  if (typeof window === 'undefined') return '';
-  return window.sessionStorage.getItem(OWNER_TOKEN_KEY) ?? '';
+  return inMemoryOwnerToken;
 }
 
 export function setOwnerToken(token: string | null) {
-  if (typeof window === 'undefined') return;
-  if (!token) {
-    window.sessionStorage.removeItem(OWNER_TOKEN_KEY);
-  } else {
-    window.sessionStorage.setItem(OWNER_TOKEN_KEY, token);
-  }
+  inMemoryOwnerToken = token ? token.trim() : '';
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -67,7 +61,12 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { 'x-ng-owner-token': token } : {}),
+      ...(token
+        ? {
+            Authorization: `Bearer ${token}`,
+            'x-ng-owner-token': token,
+          }
+        : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -112,7 +111,12 @@ export async function approveArchiveLocation(payload: {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { 'x-ng-owner-token': token } : {}),
+      ...(token
+        ? {
+            Authorization: `Bearer ${token}`,
+            'x-ng-owner-token': token,
+          }
+        : {}),
     },
     body: JSON.stringify(payload),
   });
@@ -230,6 +234,17 @@ export function fetchAndroidBridgeStatus(): Promise<{ diagnostics: AndroidBridge
   return requestJson(`${API_BASE}/android/bridge-status`);
 }
 
+export function requestAndroidBridgeChallenge(): Promise<{
+  challengeId: string;
+  challenge: string;
+  expiresAt: string;
+}> {
+  return requestJson(`${API_BASE}/android/challenge`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 export function submitAndroidBridgeAttestation(
   payload: Record<string, unknown>,
 ): Promise<{ diagnostics: AndroidBridgeDiagnostics }> {
@@ -268,6 +283,7 @@ export function fetchSecurityStatus(): Promise<SecuritySnapshot> {
 export async function setupOwnerPasskey(input: {
   passkey: string;
   deviceLabel?: string;
+  bootstrapToken?: string;
 }): Promise<{ sessionId: string; sessionToken: string; snapshot: SecuritySnapshot }> {
   const res = await requestJson<{
     sessionId: string;
@@ -663,7 +679,12 @@ export async function downloadDeliveryPackageZip(packageId: string, fallbackFile
   const response = await fetch(`${API_BASE}/wings/ngip/packages/${encodeURIComponent(packageId)}/download`, {
     method: 'GET',
     headers: {
-      ...(token ? { 'x-ng-owner-token': token } : {}),
+      ...(token
+        ? {
+            Authorization: `Bearer ${token}`,
+            'x-ng-owner-token': token,
+          }
+        : {}),
     },
   });
 

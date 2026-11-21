@@ -12,11 +12,13 @@ import {
   syncOnlineWorkersTelemetry,
 } from '../server/services/realtimeSyncService.ts';
 import {
+  createIndependentMind,
   createTrainingJob,
   probeWorkerConnection,
   recordJobTelemetry,
   registerWorker,
 } from '../server/services/mindFactoryService.ts';
+import { registerResource } from '../server/services/dataFactoryService.ts';
 import { getMasterDashboardSnapshot } from '../server/services/dashboardService.ts';
 
 function setupIsolatedSyncDb() {
@@ -66,9 +68,27 @@ test('Performance & Training metric collectors reflect live OS telemetry and SQL
       systemRamGb: 64,
     });
 
+    const ds1 = registerResource(db, {
+      librarySection: 'DATASET',
+      name: 'Sync-Test-Dataset',
+      resourceType: 'JSONL',
+      originSource: 'LOCAL',
+      license: 'Apache-2.0',
+      contentText: '{"text":"Sync test sample line 1"}\n',
+    });
+    const mind1 = createIndependentMind(db, {
+      name: 'Sync-Mind-7B',
+      version: '1.0.0',
+      scaleTier: '7B',
+      architecture: 'NG-7B-LoRA',
+      tokenizerSpec: 'NG-BPE-32K',
+      license: 'Apache-2.0',
+      baseDatasetId: ds1.resource.id,
+    });
+
     const created = await createTrainingJob(db, {
-      modelId: 'PRD-SYNC-01',
-      datasetId: 'RES-SYNC-DATA',
+      modelId: mind1.productId,
+      datasetId: ds1.resource.id,
       workerId: worker.id,
       architecture: 'NG-7B-LoRA',
       scaleTier: '7B',
@@ -158,9 +178,27 @@ test('syncOnlineWorkersTelemetry pulls real /metrics from live HTTP worker and d
     const probe = await probeWorkerConnection(db, worker.id);
     assert.equal(probe.reachable, true);
 
+    const ds2 = registerResource(db, {
+      librarySection: 'DATASET',
+      name: 'Live-Sync-Corpus',
+      resourceType: 'JSONL',
+      originSource: 'LOCAL',
+      license: 'Apache-2.0',
+      contentText: '{"text":"Live worker metrics corpus line"}\n',
+    });
+    const mind2 = createIndependentMind(db, {
+      name: 'Live-Mind-13B',
+      version: '1.0.0',
+      scaleTier: '13B',
+      architecture: 'NG-13B-LoRA',
+      tokenizerSpec: 'NG-BPE-32K',
+      license: 'Apache-2.0',
+      baseDatasetId: ds2.resource.id,
+    });
+
     const jobCreated = await createTrainingJob(db, {
-      modelId: 'PRD-LIVE-SYNC',
-      datasetId: 'RES-LIVE-CORPUS',
+      modelId: mind2.productId,
+      datasetId: ds2.resource.id,
       workerId: worker.id,
       architecture: 'NG-13B-LoRA',
       scaleTier: '13B',

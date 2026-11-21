@@ -4,6 +4,9 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { getConfigMap } from '../db/database.ts';
 import { recordAuditEvent } from '../audit/auditService.ts';
+import { inspectBinaryWeightsFile, type BinaryWeightsInspection } from '../ml/neuralMindEngine.ts';
+import { inspectTokenizerFile } from '../ml/tokenizerEngine.ts';
+import { resolveSafeRealPath, writeFileAtomic } from '../utils/fsAtomic.ts';
 
 export type QcResult = 'PASS' | 'FAIL' | 'BLOCKED' | 'PARTIAL' | 'NOT TESTED';
 
@@ -72,10 +75,21 @@ export function listQcReports(db: DatabaseSync, productId?: string): QcSuiteRepo
   });
 }
 
+function resolveWorkspaceFile(candidate: unknown, dataDir: string): string | null {
+  if (typeof candidate !== 'string' || !candidate.trim()) return null;
+  const check = resolveSafeRealPath(candidate.trim(), dataDir);
+  if (!check.allowed) return null;
+  if (!fs.existsSync(check.canonicalTarget) || !fs.statSync(check.canonicalTarget).isFile()) {
+    return null;
+  }
+  return check.canonicalTarget;
+}
+
 /**
- * Executes the 10 real engineering QC verification checks against SQLite records
- * and linked filesystem artifacts. Never fakes a PASS when metadata, checksums,
- * licenses, or safety assessments fail validation.
+ * Executes 10 strict engineering QC verification suites against real filesystem
+ * artifacts (binary weights container, tokenizer round-trip, restore checkpoint file,
+ * model_config schema, and provenance lineage). Never fakes a PASS for JSON-as-weights
+ * or virtual missing files.
  */
 export function runTenSuiteQcCheck(
   db: DatabaseSync,
@@ -123,6 +137,9 @@ export function runTenSuiteQcCheck(
     jsonValid = false;
   }
 
+  const config = getConfigMap(db);
+  const dataDir = path.resolve(config.data_dir || process.cwd());
+
   const matchingResource = db
     .prepare('SELECT id, file_path, sha256, origin_source, verification_status FROM resources WHERE sha256 = ?')
     .get(product.weights_sha256) as
@@ -135,56 +152,153 @@ export function runTenSuiteQcCheck(
       }
     | undefined;
 
-  let fileChecksumVerified = false;
-  if (matchingResource && fs.existsSync(matchingResource.file_path)) {
-    const actual = crypto
-      .createHash('sha256')
-      .update(fs.readFileSync(matchingResource.file_path))
-      .digest('hex');
-    fileChecksumVerified = actual === product.weights_sha256;
+  const linkedTrainingJob = db
+    .prepare('SELECT id, job_status, current_step FROM training_jobs WHERE model_id = ? LIMIT 1')
+    .get(product.id) as { id: string; job_status: string; current_step: number } | undefined;
+
+  // 1. Resolve and verify real binary weights file on disk
+  const weightsFilePath =
+    resolveWorkspaceFile(runtimeReq.weightsPath, dataDir) ??
+    resolveWorkspaceFile(runtimeReq.weightsManifestPath, dataDir) ??
+    resolveWorkspaceFile(matchingResource?.file_path, dataDir);
+
+  let weightsInspection: BinaryWeightsInspection = {
+    isBinaryWeights: false,
+    detectedFormat: 'UNKNOWN',
+    filePath: weightsFilePath ?? '',
+    sizeBytes: 0,
+    sha256: '',
+    tensorCount: 0,
+    parameterCount: 0,
+    nonFiniteCount: 0,
+    headerSummary: null,
+    reason: 'No verified binary weights file on disk inside data_dir',
+  };
+
+  if (weightsFilePath) {
+    weightsInspection = inspectBinaryWeightsFile(weightsFilePath);
   }
 
   const shaFormatValid = /^[a-f0-9]{64}$/.test(product.weights_sha256);
+  const binaryWeightsVerified =
+    shaFormatValid &&
+    weightsInspection.isBinaryWeights &&
+    weightsInspection.detectedFormat !== 'JSON_REJECTED' &&
+    weightsInspection.sha256 === product.weights_sha256 &&
+    weightsInspection.nonFiniteCount === 0 &&
+    weightsInspection.tensorCount > 0;
+
+  // 2. Verify model_config.json if present (or explicit mindDir/model_config.json)
+  const mindDir = typeof runtimeReq.mindDir === 'string' ? runtimeReq.mindDir : '';
+  const configFilePath =
+    resolveWorkspaceFile(runtimeReq.configPath, dataDir) ??
+    (mindDir ? resolveWorkspaceFile(path.join(mindDir, 'model_config.json'), dataDir) : null);
+
+  let configFileValid = true;
+  if (configFilePath) {
+    try {
+      const parsedCfg = JSON.parse(fs.readFileSync(configFilePath, 'utf-8')) as Record<string, unknown>;
+      configFileValid = Boolean(parsedCfg && typeof parsedCfg === 'object' && parsedCfg.architecture);
+    } catch {
+      configFileValid = false;
+    }
+  } else if (typeof runtimeReq.configPath === 'string' && runtimeReq.configPath.trim()) {
+    // Declared configPath is missing or escaped workspace!
+    configFileValid = false;
+  }
+
+  // 3. Tokenizer consistency verification (real tokenizer.json encode/decode round-trip)
+  const tokenizerFilePath =
+    resolveWorkspaceFile(runtimeReq.tokenizerPath, dataDir) ??
+    (mindDir ? resolveWorkspaceFile(path.join(mindDir, 'tokenizer.json'), dataDir) : null);
+
+  const tokenizerInspection = tokenizerFilePath
+    ? inspectTokenizerFile(tokenizerFilePath)
+    : {
+        valid: false,
+        spec: '',
+        vocabSize: 0,
+        mergesCount: 0,
+        roundTripPassed: false,
+        sha256: '',
+        reason: 'tokenizer.json not found on disk inside data_dir',
+      };
+
+  // 4. License & Provenance & Safety
   const licenseClean = !DISALLOWED_LICENSES.has(product.license.trim().toUpperCase());
   const hasSafetyNotes =
-    typeof safetyReport.notes === 'string' && safetyReport.notes.trim().length >= 5;
+    typeof safetyReport.notes === 'string' && safetyReport.notes.trim().length >= 8;
 
-  const restorePathRaw =
+  // 5. Restore checkpoint file must physically exist inside data_dir
+  const restoreCandidate =
     (typeof safetyReport.restoreCheckpointPath === 'string' && safetyReport.restoreCheckpointPath.trim()) ||
     (typeof runtimeReq.restoreCheckpointPath === 'string' && runtimeReq.restoreCheckpointPath.trim()) ||
     '';
+  const resolvedRestoreFile = resolveWorkspaceFile(restoreCandidate, dataDir);
 
-  const hasPreservedOriginalOnDisk =
-    typeof safetyReport.originalBackup === 'object' &&
-    safetyReport.originalBackup !== null &&
-    typeof (safetyReport.originalBackup as { backupPath?: unknown }).backupPath === 'string' &&
-    fs.existsSync((safetyReport.originalBackup as { backupPath: string }).backupPath);
+  const originalBackupObj =
+    typeof safetyReport.originalBackup === 'object' && safetyReport.originalBackup !== null
+      ? (safetyReport.originalBackup as { backupPath?: unknown; weightsSha256?: unknown })
+      : null;
+  const resolvedBackupFile = originalBackupObj
+    ? resolveWorkspaceFile(originalBackupObj.backupPath, dataDir)
+    : null;
 
-  // If restorePath points inside the host workspace/filesystem and starts with a real path prefix (e.g. data_dir), verify it exists unless it's a logical reference string like /checkpoints/...
-  const config = getConfigMap(db);
-  const dataDir = path.resolve(config.data_dir || process.cwd());
-  const restoreExistsIfLocal =
-    !restorePathRaw.startsWith(dataDir) || fs.existsSync(restorePathRaw);
+  const hasRestoreFileOnDisk = Boolean(resolvedRestoreFile || resolvedBackupFile);
 
-  const hasRestoreRef =
-    (Boolean(restorePathRaw) && restoreExistsIfLocal) ||
-    hasPreservedOriginalOnDisk ||
-    Boolean(matchingResource && fileChecksumVerified);
+  const hasPreservedOriginals =
+    Array.isArray(safetyReport.preservedOriginals) && safetyReport.preservedOriginals.length > 0;
+  const provenanceVerified =
+    product.training_summary.trim().length >= 5 &&
+    (Boolean(linkedTrainingJob) ||
+      Boolean(matchingResource?.origin_source) ||
+      hasPreservedOriginals ||
+      Boolean(resolvedBackupFile));
 
-  const evaluations: Array<{ suite: (typeof MANDATORY_QC_SUITES)[number]; result: QcResult; detail: Record<string, unknown> }> = [
+  // Verify no declared path escapes dataDir
+  const declaredPathFields = [
+    runtimeReq.weightsPath,
+    runtimeReq.tokenizerPath,
+    runtimeReq.configPath,
+    runtimeReq.restoreCheckpointPath,
+    safetyReport.restoreCheckpointPath,
+  ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+  const allDeclaredPathsConfined = declaredPathFields.every(
+    (p) => resolveSafeRealPath(p.trim(), dataDir).allowed,
+  );
+
+  const evaluations: Array<{
+    suite: (typeof MANDATORY_QC_SUITES)[number];
+    result: QcResult;
+    detail: Record<string, unknown>;
+  }> = [
     {
       suite: 'WEIGHTS_SHA256_INTEGRITY',
-      result: shaFormatValid && (!matchingResource || fileChecksumVerified) ? 'PASS' : 'FAIL',
+      result: binaryWeightsVerified ? 'PASS' : 'FAIL',
       detail: {
         shaFormatValid,
-        linkedResourceFound: Boolean(matchingResource),
-        fileChecksumVerified,
+        weightsFilePath: weightsFilePath || null,
+        isBinaryWeights: weightsInspection.isBinaryWeights,
+        detectedFormat: weightsInspection.detectedFormat,
+        sha256Matched: weightsInspection.sha256 === product.weights_sha256,
+        nonFiniteCount: weightsInspection.nonFiniteCount,
+        tensorCount: weightsInspection.tensorCount,
+        reason: weightsInspection.reason ?? null,
       },
     },
     {
       suite: 'MANIFEST_SCHEMA_VALID',
-      result: jsonValid && product.name.trim().length > 0 && product.version.trim().length > 0 ? 'PASS' : 'FAIL',
-      detail: { jsonValid, name: product.name, version: product.version },
+      result:
+        jsonValid && product.name.trim().length > 0 && product.version.trim().length > 0 && configFileValid
+          ? 'PASS'
+          : 'FAIL',
+      detail: {
+        jsonValid,
+        name: product.name,
+        version: product.version,
+        configFilePath: configFilePath || null,
+        configFileValid,
+      },
     },
     {
       suite: 'LICENSE_COMPLIANCE',
@@ -193,50 +307,81 @@ export function runTenSuiteQcCheck(
     },
     {
       suite: 'PROVENANCE_TRACEABLE',
-      result: product.training_summary.trim().length >= 5 || Boolean(matchingResource?.origin_source) ? 'PASS' : 'FAIL',
-      detail: { trainingSummaryPresent: product.training_summary.trim().length >= 5 },
+      result: provenanceVerified ? 'PASS' : 'FAIL',
+      detail: {
+        trainingSummaryPresent: product.training_summary.trim().length >= 5,
+        linkedResourceOrigin: matchingResource?.origin_source ?? null,
+        linkedTrainingJobId: linkedTrainingJob?.id ?? null,
+        hasPreservedOriginals,
+      },
     },
     {
       suite: 'ARCHITECTURE_COMPATIBILITY',
-      result: product.architecture_summary.trim().length >= 5 ? 'PASS' : 'FAIL',
-      detail: { architectureSummary: product.architecture_summary },
+      result:
+        product.architecture_summary.trim().length >= 5 &&
+        weightsInspection.isBinaryWeights &&
+        weightsInspection.tensorCount > 0
+          ? 'PASS'
+          : 'FAIL',
+      detail: {
+        architectureSummary: product.architecture_summary,
+        tensorCount: weightsInspection.tensorCount,
+        parameterCount: weightsInspection.parameterCount,
+      },
     },
     {
       suite: 'TOKENIZER_CONSISTENCY',
-      result:
-        typeof runtimeReq.tokenizerSpec === 'string' || product.architecture_summary.trim().length >= 5
-          ? 'PASS'
-          : 'FAIL',
-      detail: { tokenizerSpec: runtimeReq.tokenizerSpec ?? 'INFERRED_FROM_ARCH' },
+      result: tokenizerInspection.valid && tokenizerInspection.roundTripPassed ? 'PASS' : 'FAIL',
+      detail: {
+        tokenizerFilePath: tokenizerFilePath || null,
+        valid: tokenizerInspection.valid,
+        roundTripPassed: tokenizerInspection.roundTripPassed,
+        spec: tokenizerInspection.spec || null,
+        vocabSize: tokenizerInspection.vocabSize,
+        mergesCount: tokenizerInspection.mergesCount,
+        reason: tokenizerInspection.reason ?? null,
+      },
     },
     {
       suite: 'SAFETY_POLICY_CHECK',
-      result: hasSafetyNotes ? 'PASS' : 'FAIL',
-      detail: { safetyNotesPresent: hasSafetyNotes },
+      result:
+        hasSafetyNotes && weightsInspection.isBinaryWeights && weightsInspection.nonFiniteCount === 0
+          ? 'PASS'
+          : 'FAIL',
+      detail: {
+        safetyNotesPresent: hasSafetyNotes,
+        nonFiniteWeights: weightsInspection.nonFiniteCount,
+      },
     },
     {
       suite: 'DEPENDENCY_AUDIT',
-      result: jsonValid ? 'PASS' : 'FAIL',
-      detail: { runtimeRequirementsKeys: Object.keys(runtimeReq).length },
+      result:
+        jsonValid && licenseClean && Object.keys(runtimeReq).length > 0 && allDeclaredPathsConfined
+          ? 'PASS'
+          : 'FAIL',
+      detail: {
+        runtimeRequirementsKeys: Object.keys(runtimeReq).length,
+        allDeclaredPathsConfined,
+      },
     },
     {
       suite: 'RESTORE_CHECKPOINT_PRESENT',
-      result: hasRestoreRef ? 'PASS' : 'FAIL',
+      result: hasRestoreFileOnDisk ? 'PASS' : 'FAIL',
       detail: {
-        hasRestoreRef,
-        restorePathRaw: restorePathRaw || null,
-        hasPreservedOriginalOnDisk,
+        hasRestoreFileOnDisk,
+        resolvedRestoreFile: resolvedRestoreFile || null,
+        resolvedBackupFile: resolvedBackupFile || null,
       },
     },
     {
       suite: 'RELEASE_METADATA_COMPLETE',
       result:
-        product.evaluation_summary.trim().length >= 3 || product.changelog.trim().length >= 3
+        product.evaluation_summary.trim().length >= 5 && product.changelog.trim().length >= 5
           ? 'PASS'
           : 'FAIL',
       detail: {
-        evaluationSummaryPresent: product.evaluation_summary.trim().length >= 3,
-        changelogPresent: product.changelog.trim().length >= 3,
+        evaluationSummaryPresent: product.evaluation_summary.trim().length >= 5,
+        changelogPresent: product.changelog.trim().length >= 5,
       },
     },
   ];
@@ -245,7 +390,6 @@ export function runTenSuiteQcCheck(
   const allPassed = passedCount === evaluations.length;
   const now = new Date().toISOString();
 
-  // Persist cryptographically verifiable QC evidence dossier file on disk
   const evidenceDir = path.join(dataDir, 'qc_evidence');
   fs.mkdirSync(evidenceDir, { recursive: true });
   const evidencePath = path.join(evidenceDir, `QC_EVIDENCE_${productId}_${Date.now()}.json`);
@@ -265,7 +409,7 @@ export function runTenSuiteQcCheck(
     null,
     2,
   );
-  fs.writeFileSync(evidencePath, evidencePayload, 'utf-8');
+  writeFileAtomic(evidencePath, evidencePayload, 'utf-8');
   const evidenceSha256 = crypto.createHash('sha256').update(evidencePayload, 'utf-8').digest('hex');
 
   db.prepare('DELETE FROM qc_reports WHERE product_id = ?').run(productId);
@@ -281,7 +425,13 @@ export function runTenSuiteQcCheck(
       productId,
       item.suite,
       item.result,
-      JSON.stringify({ ...item.detail, evidencePath, evidenceSha256 }),
+      JSON.stringify({
+        ...item.detail,
+        productVersion: product.version,
+        weightsSha256: product.weights_sha256,
+        evidencePath,
+        evidenceSha256,
+      }),
       now,
     );
   }

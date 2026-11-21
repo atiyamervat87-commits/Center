@@ -4,7 +4,9 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { getConfigMap } from '../db/database.ts';
 import { recordAuditEvent } from '../audit/auditService.ts';
-import { buildZipArchive } from '../utils/zipBuilder.ts';
+import { buildZipArchive, extractAndVerifyZipArchive, type ZipInputFile } from '../utils/zipBuilder.ts';
+import { resolveSafeRealPath, writeFileAtomic } from '../utils/fsAtomic.ts';
+import { inspectBinaryWeightsBuffer } from '../ml/neuralMindEngine.ts';
 import { REQUIRED_QC_SUITES_COUNT } from './repairRegistryService.ts';
 
 export interface DeliveryPackageRecord {
@@ -45,6 +47,16 @@ export function listDeliveryPackages(db: DatabaseSync): DeliveryPackageRecord[] 
 }
 
 const DISALLOWED_IP_LICENSES = new Set(['', 'UNKNOWN', 'NONE', 'UNLICENSED', 'N/A']);
+
+function resolveWorkspaceArtifact(candidate: unknown, dataDir: string): string | null {
+  if (typeof candidate !== 'string' || !candidate.trim()) return null;
+  const check = resolveSafeRealPath(candidate.trim(), dataDir);
+  if (!check.allowed) return null;
+  if (!fs.existsSync(check.canonicalTarget) || !fs.statSync(check.canonicalTarget).isFile()) {
+    return null;
+  }
+  return check.canonicalTarget;
+}
 
 export function buildCertifiedDeliveryPackage(
   db: DatabaseSync,
@@ -103,26 +115,8 @@ export function buildCertifiedDeliveryPackage(
     );
   }
 
-  const qcPassRow = db
-    .prepare("SELECT COUNT(DISTINCT test_suite) AS count FROM qc_reports WHERE product_id = ? AND result = 'PASS'")
-    .get(productId) as { count: number };
-
-  if (qcPassRow.count < REQUIRED_QC_SUITES_COUNT) {
-    recordAuditEvent(db, {
-      actor: 'OWNER',
-      category: 'NG_IP',
-      action: 'BLOCK_QC_INCOMPLETE_DELIVERY',
-      target: productId,
-      outcome: 'BLOCKED',
-      details: { passedSuites: qcPassRow.count, requiredSuites: REQUIRED_QC_SUITES_COUNT },
-    });
-    throw new Error(
-      `Blocked: Product ${productId} has only ${qcPassRow.count}/${REQUIRED_QC_SUITES_COUNT} passing QC suites.`,
-    );
-  }
-
   const qcReports = db
-    .prepare('SELECT test_suite, result, details_json, executed_at FROM qc_reports WHERE product_id = ? ORDER BY test_suite ASC')
+    .prepare("SELECT test_suite, result, details_json, executed_at FROM qc_reports WHERE product_id = ? ORDER BY test_suite ASC")
     .all(productId) as unknown as Array<{
     test_suite: string;
     result: string;
@@ -130,21 +124,96 @@ export function buildCertifiedDeliveryPackage(
     executed_at: string;
   }>;
 
+  const passedCurrentSuites = new Set<string>();
   let qcEvidenceSha256 = '';
-  if (qcReports.length > 0) {
+  let qcEvidencePath = '';
+  for (const q of qcReports) {
+    if (q.result !== 'PASS') continue;
     try {
-      const parsed = JSON.parse(qcReports[0].details_json) as { evidenceSha256?: string };
-      if (typeof parsed.evidenceSha256 === 'string') qcEvidenceSha256 = parsed.evidenceSha256;
+      const parsed = JSON.parse(q.details_json) as {
+        productVersion?: string;
+        weightsSha256?: string;
+        evidenceSha256?: string;
+        evidencePath?: string;
+      };
+      if (parsed.productVersion === product.version && parsed.weightsSha256 === product.weights_sha256) {
+        passedCurrentSuites.add(q.test_suite);
+        if (!qcEvidenceSha256 && typeof parsed.evidenceSha256 === 'string') {
+          qcEvidenceSha256 = parsed.evidenceSha256;
+        }
+        if (!qcEvidencePath && typeof parsed.evidencePath === 'string') {
+          qcEvidencePath = parsed.evidencePath;
+        }
+      }
     } catch {
-      qcEvidenceSha256 = '';
+      // ignore unparseable detail
     }
   }
+
+  if (passedCurrentSuites.size < REQUIRED_QC_SUITES_COUNT) {
+    recordAuditEvent(db, {
+      actor: 'OWNER',
+      category: 'NG_IP',
+      action: 'BLOCK_QC_INCOMPLETE_DELIVERY',
+      target: productId,
+      outcome: 'BLOCKED',
+      details: {
+        passedSuites: passedCurrentSuites.size,
+        requiredSuites: REQUIRED_QC_SUITES_COUNT,
+      },
+    });
+    throw new Error(
+      `Blocked: Product ${productId} has only ${passedCurrentSuites.size}/${REQUIRED_QC_SUITES_COUNT} passing QC suites for current weights.`,
+    );
+  }
+
+  const config = getConfigMap(db);
+  const dataDir = path.resolve(config.data_dir || process.cwd());
+  let runtimeReq: Record<string, unknown> = {};
+  try {
+    runtimeReq = JSON.parse(product.runtime_requirements_json) as Record<string, unknown>;
+  } catch {
+    runtimeReq = {};
+  }
+
+  const matchingResource = db
+    .prepare('SELECT file_path FROM resources WHERE sha256 = ?')
+    .get(product.weights_sha256) as { file_path: string } | undefined;
+
+  const weightsFilePath =
+    resolveWorkspaceArtifact(runtimeReq.weightsPath, dataDir) ??
+    resolveWorkspaceArtifact(runtimeReq.weightsManifestPath, dataDir) ??
+    resolveWorkspaceArtifact(matchingResource?.file_path, dataDir);
+
+  if (!weightsFilePath) {
+    throw new Error(
+      `Blocked: Binary weights file for product ${productId} is missing on disk inside data_dir; cannot assemble certified delivery ZIP.`,
+    );
+  }
+
+  const weightsBuf = fs.readFileSync(weightsFilePath);
+  const weightsInspection = inspectBinaryWeightsBuffer(weightsBuf, weightsFilePath);
+  if (!weightsInspection.isBinaryWeights || weightsInspection.sha256 !== product.weights_sha256) {
+    throw new Error(
+      `Blocked: Weights file failed binary/SHA-256 verification before packaging (${weightsInspection.reason || 'digest mismatch'}).`,
+    );
+  }
+
+  const mindDir = typeof runtimeReq.mindDir === 'string' ? runtimeReq.mindDir : '';
+  const tokenizerFilePath =
+    resolveWorkspaceArtifact(runtimeReq.tokenizerPath, dataDir) ??
+    (mindDir ? resolveWorkspaceArtifact(path.join(mindDir, 'tokenizer.json'), dataDir) : null);
+  const configFilePath =
+    resolveWorkspaceArtifact(runtimeReq.configPath, dataDir) ??
+    (mindDir ? resolveWorkspaceArtifact(path.join(mindDir, 'model_config.json'), dataDir) : null);
+  const evidenceFilePath = resolveWorkspaceArtifact(qcEvidencePath, dataDir);
 
   const ipHolder = options.ipHolder?.trim() || 'NG-ILMF Owner / Sovereign Factory IP Holder';
   const licenseTermsNote =
     options.licenseTermsNote?.trim() ||
     `Redistribution and deployment are strictly governed by the declared '${product.license}' license terms and verified SHA-256 weights digest.`;
 
+  const weightsArchiveEntryName = `weights/${path.basename(weightsFilePath)}`;
   const generatedAt = new Date().toISOString();
   const manifestObj = {
     factory: 'NG-ILMF — Future Generations Intelligent Minds Factory',
@@ -153,12 +222,20 @@ export function buildCertifiedDeliveryPackage(
     productClass: product.product_class,
     version: product.version,
     lifecycleState: product.lifecycle_state,
+    weightsEntry: weightsArchiveEntryName,
+    weightsFormat: weightsInspection.detectedFormat,
     weightsSha256: product.weights_sha256,
+    weightsSizeBytes: weightsBuf.length,
+    tensorCount: weightsInspection.tensorCount,
+    parameterCount: weightsInspection.parameterCount,
+    tokenizerBundled: Boolean(tokenizerFilePath),
+    configBundled: Boolean(configFilePath),
+    qcEvidenceBundled: Boolean(evidenceFilePath),
     license: product.license,
     ipHolder,
     qcEvidenceSha256: qcEvidenceSha256 || null,
     architectureSummary: product.architecture_summary,
-    qcSuitesPassed: qcPassRow.count,
+    qcSuitesPassed: passedCurrentSuites.size,
     generatedAt,
   };
 
@@ -174,6 +251,7 @@ export function buildCertifiedDeliveryPackage(
     `- **Lifecycle State:** \`${product.lifecycle_state}\``,
     `- **IP Holder:** ${ipHolder}`,
     `- **License & IP:** \`${product.license}\``,
+    `- **Weights Archive Entry:** \`${weightsArchiveEntryName}\` (\`${weightsInspection.detectedFormat}\`, ${weightsBuf.length} bytes)`,
     `- **Weights SHA-256:** \`${product.weights_sha256}\``,
     `- **QC Evidence SHA-256:** \`${qcEvidenceSha256 || 'EMBEDDED_IN_SQLITE_QC'}\``,
     `- **Manifest SHA-256:** \`${manifestSha256}\``,
@@ -188,7 +266,7 @@ export function buildCertifiedDeliveryPackage(
     `## Evaluation Summary`,
     product.evaluation_summary || 'Evaluated via 10-suite Trust & Security QC.',
     ``,
-    `## Trust & Security 10-Suite QC Results (${qcPassRow.count}/${REQUIRED_QC_SUITES_COUNT})`,
+    `## Trust & Security 10-Suite QC Results (${passedCurrentSuites.size}/${REQUIRED_QC_SUITES_COUNT})`,
     ...qcReports.map((q) => `- \`${q.test_suite}\`: **${q.result}** (${q.executed_at})`),
     ``,
     `## Changelog`,
@@ -209,31 +287,46 @@ export function buildCertifiedDeliveryPackage(
     `Issued At: ${generatedAt}`,
   ].join('\n');
 
-  const checksumsTxt = [
-    `${manifestSha256}  MANIFEST.json`,
-    `${crypto.createHash('sha256').update(technicalDossier, 'utf-8').digest('hex')}  TECHNICAL_REPORT.md`,
-    `${crypto.createHash('sha256').update(licenseNotice, 'utf-8').digest('hex')}  LICENSE_AND_IP.txt`,
-  ].join('\n');
-
-  const { buffer: zipBuffer, sha256: packageSha256 } = buildZipArchive([
+  const bundleFiles: ZipInputFile[] = [
     { name: 'MANIFEST.json', content: manifestJson },
     { name: 'TECHNICAL_REPORT.md', content: technicalDossier },
     { name: 'LICENSE_AND_IP.txt', content: licenseNotice },
-    { name: 'CHECKSUMS.sha256', content: checksumsTxt },
-  ]);
+    { name: weightsArchiveEntryName, content: weightsBuf },
+  ];
 
-  const config = getConfigMap(db);
-  const deliveriesDir = path.join(path.resolve(config.data_dir || process.cwd()), 'exports', 'deliveries');
+  if (tokenizerFilePath) {
+    bundleFiles.push({ name: 'tokenizer.json', content: fs.readFileSync(tokenizerFilePath) });
+  }
+  if (configFilePath) {
+    bundleFiles.push({ name: 'model_config.json', content: fs.readFileSync(configFilePath) });
+  }
+  if (evidenceFilePath) {
+    bundleFiles.push({ name: 'QC_EVIDENCE.json', content: fs.readFileSync(evidenceFilePath) });
+  }
+
+  const checksumLines = bundleFiles.map((f) => {
+    const raw = Buffer.isBuffer(f.content) ? f.content : Buffer.from(f.content, 'utf-8');
+    const digest = crypto.createHash('sha256').update(raw).digest('hex');
+    return `${digest}  ${f.name}`;
+  });
+  bundleFiles.push({ name: 'CHECKSUMS.sha256', content: checksumLines.join('\n') + '\n' });
+
+  const { buffer: zipBuffer, sha256: packageSha256 } = buildZipArchive(bundleFiles);
+
+  const deliveriesDir = path.join(dataDir, 'exports', 'deliveries');
   fs.mkdirSync(deliveriesDir, { recursive: true });
 
   const safeSlug = product.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '_').slice(0, 36) || 'product';
   const zipFileName = `${product.id}_${safeSlug}_v${product.version.replace(/[^a-zA-Z0-9._-]/g, '_')}.zip`;
   const zipPath = path.join(deliveriesDir, zipFileName);
-  fs.writeFileSync(zipPath, zipBuffer);
+  writeFileAtomic(zipPath, zipBuffer);
 
-  // Read back written ZIP from disk & verify SHA-256
-  const readBackSha = crypto.createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
-  const verified = readBackSha === packageSha256;
+  // Decompress & cryptographically verify the written ZIP file before certifying it in SQLite
+  const readBackBuf = fs.readFileSync(zipPath);
+  const readBackSha = crypto.createHash('sha256').update(readBackBuf).digest('hex');
+  const extracted = extractAndVerifyZipArchive(readBackBuf);
+  const verified =
+    readBackSha === packageSha256 && extracted.validStructure && extracted.allCrcValid;
 
   const pkgId = `PKG-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
   db.prepare(
@@ -251,7 +344,16 @@ export function buildCertifiedDeliveryPackage(
     action: 'BUILD_CERTIFIED_DELIVERY_ZIP',
     target: zipPath,
     outcome: verified ? 'PASS' : 'FAIL',
-    details: { pkgId, productId: product.id, ipHolder, manifestSha256, packageSha256, sizeBytes: zipBuffer.length },
+    details: {
+      pkgId,
+      productId: product.id,
+      ipHolder,
+      manifestSha256,
+      packageSha256,
+      sizeBytes: zipBuffer.length,
+      entriesBundled: bundleFiles.length,
+      weightsBundled: weightsArchiveEntryName,
+    },
   });
 
   return listDeliveryPackages(db).find((p) => p.id === pkgId)!;
@@ -265,6 +367,9 @@ export function verifyDeliveryPackageIntegrity(
   fileExists: boolean;
   validPkzipHeader: boolean;
   sha256Matched: boolean;
+  allEntriesVerified: boolean;
+  entriesCheckedCount: number;
+  containsBinaryWeights: boolean;
   actualSha256: string;
 } {
   const pkg = listDeliveryPackages(db).find((p) => p.id === packageId);
@@ -287,6 +392,9 @@ export function verifyDeliveryPackageIntegrity(
       fileExists: false,
       validPkzipHeader: false,
       sha256Matched: false,
+      allEntriesVerified: false,
+      entriesCheckedCount: 0,
+      containsBinaryWeights: false,
       actualSha256: '',
     };
   }
@@ -296,7 +404,52 @@ export function verifyDeliveryPackageIntegrity(
   const validPkzipHeader =
     buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
   const sha256Matched = actualSha256 === pkg.packageSha256;
-  const verified = validPkzipHeader && sha256Matched;
+
+  // Extract every entry, verify CRC-32, verify CHECKSUMS.sha256 entries, and inspect binary weights entry
+  const extracted = extractAndVerifyZipArchive(buf);
+  let checksumsValid = false;
+  let containsBinaryWeights = false;
+
+  if (extracted.validStructure && extracted.allCrcValid) {
+    const checksumsEntry = extracted.entries.get('CHECKSUMS.sha256');
+    const manifestEntry = extracted.entries.get('MANIFEST.json');
+    const reportEntry = extracted.entries.get('TECHNICAL_REPORT.md');
+    const licenseEntry = extracted.entries.get('LICENSE_AND_IP.txt');
+
+    if (checksumsEntry && manifestEntry && reportEntry && licenseEntry) {
+      const lines = checksumsEntry.content
+        .toString('utf-8')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      checksumsValid = lines.length > 0;
+      for (const line of lines) {
+        const match = line.match(/^([a-f0-9]{64})\s+(.+)$/);
+        if (!match) {
+          checksumsValid = false;
+          break;
+        }
+        const [, expectedDigest, entryName] = match;
+        const entry = extracted.entries.get(entryName.trim());
+        if (!entry || entry.sha256 !== expectedDigest) {
+          checksumsValid = false;
+          break;
+        }
+      }
+    }
+
+    for (const [entryName, entry] of extracted.entries.entries()) {
+      if (entryName.startsWith('weights/')) {
+        const insp = inspectBinaryWeightsBuffer(entry.content, entryName);
+        if (insp.isBinaryWeights) {
+          containsBinaryWeights = true;
+        }
+      }
+    }
+  }
+
+  const allEntriesVerified = extracted.validStructure && extracted.allCrcValid && checksumsValid;
+  const verified = validPkzipHeader && sha256Matched && allEntriesVerified && containsBinaryWeights;
 
   db.prepare('UPDATE delivery_packages SET verified = ? WHERE id = ?').run(verified ? 1 : 0, packageId);
   recordAuditEvent(db, {
@@ -305,7 +458,15 @@ export function verifyDeliveryPackageIntegrity(
     action: 'VERIFY_DELIVERY_ZIP_INTEGRITY',
     target: pkg.zipPath,
     outcome: verified ? 'PASS' : 'FAIL',
-    details: { packageId, expectedSha256: pkg.packageSha256, actualSha256, validPkzipHeader },
+    details: {
+      packageId,
+      expectedSha256: pkg.packageSha256,
+      actualSha256,
+      validPkzipHeader,
+      allEntriesVerified,
+      entriesCheckedCount: extracted.entryCount,
+      containsBinaryWeights,
+    },
   });
 
   return {
@@ -313,6 +474,9 @@ export function verifyDeliveryPackageIntegrity(
     fileExists: true,
     validPkzipHeader,
     sha256Matched,
+    allEntriesVerified,
+    entriesCheckedCount: extracted.entryCount,
+    containsBinaryWeights,
     actualSha256,
   };
 }

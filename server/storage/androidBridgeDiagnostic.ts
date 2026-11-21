@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { getConfigMap, setConfigValue } from '../db/database.ts';
@@ -28,6 +29,8 @@ export interface AndroidNativeAttestation {
   persistedRead: boolean;
   persistedWrite: boolean;
   revoked: boolean;
+  challengeId?: string;
+  challengeVerified?: boolean;
   safProbeReport?: AndroidSafProbeAttestation | null;
   attestedAt: string;
 }
@@ -49,8 +52,112 @@ export interface AndroidBridgeDiagnostics {
   diagnosticNote: string;
 }
 
+interface StoredChallenge {
+  id: string;
+  challenge: string;
+  expiresAt: string;
+  used: boolean;
+}
+
+const CHALLENGE_CONFIG_KEY = 'android_attestation_challenges_json';
+
 export function isValidContentSafUri(uri: string): boolean {
   return uri.trim().startsWith('content://');
+}
+
+export function issueAndroidAttestationChallenge(db: DatabaseSync): {
+  challengeId: string;
+  challenge: string;
+  expiresAt: string;
+} {
+  const config = getConfigMap(db);
+  let existing: StoredChallenge[] = [];
+  if (config[CHALLENGE_CONFIG_KEY]) {
+    try {
+      const parsed = JSON.parse(config[CHALLENGE_CONFIG_KEY]) as StoredChallenge[];
+      if (Array.isArray(parsed)) existing = parsed;
+    } catch {
+      existing = [];
+    }
+  }
+
+  const nowMs = Date.now();
+  const active = existing
+    .filter((c) => !c.used && new Date(c.expiresAt).getTime() > nowMs)
+    .slice(-9);
+
+  const challengeId = `ACH-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const challenge = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(nowMs + 5 * 60 * 1000).toISOString();
+
+  active.push({ id: challengeId, challenge, expiresAt, used: false });
+  setConfigValue(db, CHALLENGE_CONFIG_KEY, JSON.stringify(active), 'Single-use Android bridge attestation challenges');
+
+  return { challengeId, challenge, expiresAt };
+}
+
+function consumeAndVerifyAndroidChallenge(
+  db: DatabaseSync,
+  payload: {
+    challengeId?: string;
+    challenge?: string;
+    proofSignature?: string;
+    model: string;
+    sdkInt: number;
+    safUri: string;
+    expectedSha256?: string;
+  },
+): boolean {
+  const config = getConfigMap(db);
+  let list: StoredChallenge[] = [];
+  if (config[CHALLENGE_CONFIG_KEY]) {
+    try {
+      const parsed = JSON.parse(config[CHALLENGE_CONFIG_KEY]) as StoredChallenge[];
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      list = [];
+    }
+  }
+
+  const matchIdx = list.findIndex(
+    (c) => c.id === payload.challengeId && !c.used,
+  );
+  if (matchIdx === -1) {
+    throw new Error('Rejected: Unknown, expired, or already-consumed Android attestation challengeId.');
+  }
+
+  const entry = list[matchIdx];
+  if (new Date(entry.expiresAt).getTime() <= Date.now()) {
+    throw new Error('Rejected: Android attestation challenge expired. Request a new challenge.');
+  }
+
+  if (!payload.challenge) {
+    throw new Error('Rejected: Challenge nonce mismatch.');
+  }
+  const a = Buffer.from(entry.challenge, 'utf-8');
+  const b = Buffer.from(payload.challenge.trim(), 'utf-8');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    throw new Error('Rejected: Challenge nonce mismatch.');
+  }
+
+  const expectedProofMessage = `${payload.model}|${payload.sdkInt}|${payload.safUri}|${payload.expectedSha256 ?? ''}|${entry.challenge}`;
+  const expectedSig = crypto
+    .createHmac('sha256', entry.challenge)
+    .update(expectedProofMessage)
+    .digest('hex');
+
+  const suppliedSig = (payload.proofSignature ?? '').trim().toLowerCase();
+  const sigBufA = Buffer.from(expectedSig, 'utf-8');
+  const sigBufB = Buffer.from(suppliedSig, 'utf-8');
+  if (sigBufA.length !== sigBufB.length || !crypto.timingSafeEqual(sigBufA, sigBufB)) {
+    throw new Error('Rejected: Invalid Android bridge HMAC challenge signature.');
+  }
+
+  // Mark challenge as consumed (anti-replay)
+  list[matchIdx] = { ...entry, used: true };
+  const retained = list.filter((c) => new Date(c.expiresAt).getTime() > Date.now()).slice(-10);
+  setConfigValue(db, CHALLENGE_CONFIG_KEY, JSON.stringify(retained));
+  return true;
 }
 
 export function computeAndroidBridgeDiagnostics(
@@ -79,12 +186,10 @@ export function computeAndroidBridgeDiagnostics(
   const safUriValidScheme = isValidContentSafUri(safUri);
   const permissionRevoked = Boolean(attestation?.revoked);
 
-  // ANDROID_CONNECTED requires real Android OS runtime OR verified native Android Wrapper attestation
   const ANDROID_CONNECTED = osAndroidPresent || Boolean(attestation?.isNativeAndroid);
   const TERMUX_CONNECTED =
     osTermuxPresent || Boolean(ANDROID_CONNECTED && attestation?.termuxPackageInstalled);
 
-  // SD_AUTHORIZED requires ANDROID_CONNECTED + content:// URI + persisted R/W + not revoked
   const SD_AUTHORIZED =
     ANDROID_CONNECTED &&
     safUriValidScheme &&
@@ -92,7 +197,6 @@ export function computeAndroidBridgeDiagnostics(
     Boolean(attestation?.persistedRead) &&
     Boolean(attestation?.persistedWrite);
 
-  // SD_READ_WRITE_VERIFIED requires real native SAF SHA-256 read/write/compare/cleanup test
   const safProbe = attestation?.safProbeReport;
   const SD_READ_WRITE_VERIFIED =
     SD_AUTHORIZED &&
@@ -143,7 +247,12 @@ export function computeAndroidBridgeDiagnostics(
 
 export function recordNativeAndroidAttestation(
   db: DatabaseSync,
-  payload: Partial<AndroidNativeAttestation>,
+  payload: Partial<AndroidNativeAttestation> & {
+    challengeId?: string;
+    challenge?: string;
+    proofSignature?: string;
+  },
+  options: { requireChallenge?: boolean } = {},
 ): AndroidBridgeDiagnostics {
   if (payload.isNativeAndroid !== true || typeof payload.sdkInt !== 'number' || payload.sdkInt < 29) {
     throw new Error(
@@ -158,10 +267,24 @@ export function recordNativeAndroidAttestation(
     );
   }
 
+  const model = (payload.model ?? 'Unknown Android').trim();
+  let challengeVerified = false;
+  if (options.requireChallenge || payload.challengeId || payload.challenge || payload.proofSignature) {
+    challengeVerified = consumeAndVerifyAndroidChallenge(db, {
+      challengeId: payload.challengeId,
+      challenge: payload.challenge,
+      proofSignature: payload.proofSignature,
+      model,
+      sdkInt: payload.sdkInt,
+      safUri,
+      expectedSha256: payload.safProbeReport?.expectedSha256,
+    });
+  }
+
   const normalized: AndroidNativeAttestation = {
     isNativeAndroid: true,
     manufacturer: (payload.manufacturer ?? '').trim(),
-    model: (payload.model ?? 'Unknown Android').trim(),
+    model,
     androidRelease: (payload.androidRelease ?? '').trim(),
     sdkInt: payload.sdkInt,
     termuxPackageInstalled: Boolean(payload.termuxPackageInstalled),
@@ -169,6 +292,8 @@ export function recordNativeAndroidAttestation(
     persistedRead: Boolean(payload.persistedRead),
     persistedWrite: Boolean(payload.persistedWrite),
     revoked: Boolean(payload.revoked),
+    challengeId: payload.challengeId,
+    challengeVerified,
     safProbeReport: payload.safProbeReport ?? null,
     attestedAt: new Date().toISOString(),
   };
@@ -206,6 +331,7 @@ export function recordNativeAndroidAttestation(
       flags: diagnostics.flags,
       model: normalized.model,
       sdkInt: normalized.sdkInt,
+      challengeVerified,
     },
   });
 

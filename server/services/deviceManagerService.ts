@@ -7,6 +7,7 @@ import { getConfigMap } from '../db/database.ts';
 import { recordAuditEvent } from '../audit/auditService.ts';
 import { probeDeviceEnvironment } from '../storage/storageProbe.ts';
 import { computeAndroidBridgeDiagnostics } from '../storage/androidBridgeDiagnostic.ts';
+import { isSqliteProtectedFile, resolveSafeRealPath } from '../utils/fsAtomic.ts';
 
 export interface CleanupSuggestion {
   id: string;
@@ -290,36 +291,39 @@ export function executeOwnerApprovedCleanup(
 
   const config = getConfigMap(db);
   const dataDir = path.resolve(config.data_dir || process.cwd());
-  const target = path.resolve(input.filePath);
+  const resolvedCheck = resolveSafeRealPath(input.filePath, dataDir);
 
-  // Security boundary: only permit deleting files inside app-owned data_dir, and never SQLite DB files
-  if (!target.startsWith(`${dataDir}${path.sep}`)) {
+  // Security boundary: canonical target (following symlinks) must stay inside app-owned data_dir, and never SQLite DB files
+  if (!resolvedCheck.allowed) {
     recordAuditEvent(db, {
       actor: 'OWNER',
       category: 'CLEANUP',
       action: 'BLOCK_OUTSIDE_WORKSPACE_DELETE',
-      target,
+      target: resolvedCheck.canonicalTarget,
       outcome: 'BLOCKED',
-      details: { reason: 'Path outside managed workspace data_dir' },
+      details: { reason: resolvedCheck.reason || 'Path outside managed workspace data_dir' },
     });
     throw new Error('Blocked: Cleanup can only delete files inside the managed app workspace directory.');
   }
 
-  const base = path.basename(target);
-  if (base.includes('.sqlite')) {
+  const target = resolvedCheck.canonicalTarget;
+
+  if (isSqliteProtectedFile(target)) {
     recordAuditEvent(db, {
       actor: 'OWNER',
       category: 'CLEANUP',
       action: 'BLOCK_ACTIVE_DB_DELETE',
       target,
       outcome: 'BLOCKED',
-      details: { reason: 'Active database file is in use' },
+      details: { reason: 'Active database or WAL/SHM file is protected' },
     });
     throw new Error('Blocked: Active SQLite database files cannot be deleted.');
   }
 
-  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
-    throw new Error(`Target file not found: ${target}`);
+  // Reject dangling or directory symlinks explicitly
+  const lstat = fs.existsSync(target) ? fs.lstatSync(target) : null;
+  if (!lstat || lstat.isSymbolicLink() || !lstat.isFile()) {
+    throw new Error(`Target file not found or not a regular file: ${target}`);
   }
 
   const buf = fs.readFileSync(target);

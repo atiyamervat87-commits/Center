@@ -20,10 +20,10 @@ import java.util.concurrent.Executors
 /**
  * NG-ILMF Native Android WebView Host Activity (OPPO CPH1911 / Android 11+).
  *
- * Exposes `window.NgIlmfAndroidBridge` to the React Command Center frontend so all
- * Storage Access Framework (ACTION_OPEN_DOCUMENT_TREE), persistable URI grants,
- * permission checks, and SHA-256 read/write integrity probes execute genuinely on
- * the Android device rather than being simulated on a Linux host container.
+ * Security invariants:
+ * - Cleartext HTTP is only permitted to localhost / 127.0.0.1; remote hosts require HTTPS.
+ * - `window.NgIlmfAndroidBridge` is strictly bound to trusted Command Center origins and is
+ *   removed automatically if navigation attempts to leave the trusted origin.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -32,6 +32,8 @@ class MainActivity : AppCompatActivity() {
     private val bridgeExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     private var pendingPickerRequestId: String? = null
+    private var trustedOriginAuthority: String = "127.0.0.1:3000"
+    private var bridgeAttached: Boolean = false
 
     private val openDocumentTreeLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
@@ -84,6 +86,8 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         pendingPickerRequestId = savedInstanceState?.getString(KEY_PENDING_PICKER_REQUEST_ID)
+        val initialUrl = sanitizeTargetUrl(intent.getStringExtra(EXTRA_COMMAND_CENTER_URL))
+        trustedOriginAuthority = extractAuthority(Uri.parse(initialUrl))
 
         safBridge = SafStorageBridge(
             context = this,
@@ -126,16 +130,37 @@ class MainActivity : AppCompatActivity() {
                     view: WebView?,
                     request: WebResourceRequest?
                 ): Boolean {
-                    val url = request?.url ?: return false
-                    val scheme = url.scheme?.lowercase()
-                    // Keep http/https command center traffic inside the wrapper WebView
-                    return scheme != "http" && scheme != "https"
+                    val url = request?.url ?: return true
+                    val allowed = isTrustedCommandCenterUri(url)
+                    if (!allowed && bridgeAttached) {
+                        view?.removeJavascriptInterface(BRIDGE_JS_NAME)
+                        bridgeAttached = false
+                    }
+                    // Returning true blocks navigation outside trusted origin
+                    return !allowed
+                }
+
+                override fun onPageStarted(
+                    view: WebView?,
+                    url: String?,
+                    favicon: android.graphics.Bitmap?
+                ) {
+                    super.onPageStarted(view, url, favicon)
+                    val parsed = url?.let { Uri.parse(it) }
+                    if (parsed == null || !isTrustedCommandCenterUri(parsed)) {
+                        if (bridgeAttached) {
+                            view?.removeJavascriptInterface(BRIDGE_JS_NAME)
+                            bridgeAttached = false
+                        }
+                        view?.stopLoading()
+                    }
                 }
             }
         }
 
-        // Register the JS bridge before loading the frontend URL
+        // Register the JS bridge strictly before loading the trusted URL
         webView.addJavascriptInterface(safBridge, BRIDGE_JS_NAME)
+        bridgeAttached = true
         setContentView(webView)
 
         onBackPressedDispatcher.addCallback(
@@ -155,8 +180,7 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
         } else {
-            val targetUrl = sanitizeTargetUrl(intent.getStringExtra(EXTRA_COMMAND_CENTER_URL))
-            webView.loadUrl(targetUrl)
+            webView.loadUrl(initialUrl)
         }
     }
 
@@ -172,6 +196,7 @@ class MainActivity : AppCompatActivity() {
         bridgeExecutor.shutdownNow()
         if (::webView.isInitialized) {
             webView.removeJavascriptInterface(BRIDGE_JS_NAME)
+            bridgeAttached = false
             webView.destroy()
         }
         super.onDestroy()
@@ -188,12 +213,38 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun extractAuthority(uri: Uri): String {
+        val host = uri.host?.lowercase() ?: "127.0.0.1"
+        val port = if (uri.port > 0) uri.port else if (uri.scheme?.lowercase() == "https") 443 else 80
+        return "$host:$port"
+    }
+
+    private fun isTrustedCommandCenterUri(uri: Uri): Boolean {
+        val scheme = uri.scheme?.lowercase() ?: return false
+        val host = uri.host?.lowercase() ?: return false
+        val isLocal = host == "127.0.0.1" || host == "localhost"
+        if (scheme == "http" && !isLocal) {
+            return false
+        }
+        if (scheme != "http" && scheme != "https") {
+            return false
+        }
+        val authority = extractAuthority(uri)
+        return authority == trustedOriginAuthority || (isLocal && authority == "127.0.0.1:3000" || isLocal && authority == "localhost:3000")
+    }
+
     private fun sanitizeTargetUrl(candidate: String?): String {
         val trimmed = candidate?.trim().orEmpty()
         if (trimmed.isEmpty()) return DEFAULT_LOCAL_URL
         val parsed = Uri.parse(trimmed)
-        val scheme = parsed.scheme?.lowercase()
-        return if (scheme == "http" || scheme == "https") trimmed else DEFAULT_LOCAL_URL
+        val scheme = parsed.scheme?.lowercase() ?: return DEFAULT_LOCAL_URL
+        val host = parsed.host?.lowercase() ?: return DEFAULT_LOCAL_URL
+        val isLocal = host == "127.0.0.1" || host == "localhost"
+        return when {
+            scheme == "https" -> trimmed
+            scheme == "http" && isLocal -> trimmed
+            else -> DEFAULT_LOCAL_URL
+        }
     }
 
     companion object {

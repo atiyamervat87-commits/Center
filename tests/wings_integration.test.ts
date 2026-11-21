@@ -28,9 +28,10 @@ import {
 import { runTenSuiteQcCheck } from '../server/services/trustQcService.ts';
 import { buildCertifiedDeliveryPackage } from '../server/services/ngIpService.ts';
 import { createProject, linkResourceToProject } from '../server/services/projectService.ts';
-import { setConfigValue } from '../server/db/database.ts';
+import { setConfigValue, getConfigMap } from '../server/db/database.ts';
 import { runProviderIntegrityTest } from '../server/storage/storageProbe.ts';
-import { getConfigMap } from '../server/db/database.ts';
+import { initializeMindWeightsArtifact } from '../server/ml/neuralMindEngine.ts';
+import { extractAndVerifyZipArchive } from '../server/utils/zipBuilder.ts';
 
 function setupIsolatedWingsDb() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-ilmf-wings-'));
@@ -159,11 +160,28 @@ test('Wing 2 (NEW MIND FACTORY): Capacity gating (1B-30B+), honest offline/onlin
     assert.equal(offlineProbe.reachable, false);
     assert.equal(offlineProbe.worker.status, 'OFFLINE');
 
+    const capDs = registerResource(db, {
+      librarySection: 'DATASET',
+      name: 'Cap-Check-DS',
+      resourceType: 'JSONL',
+      originSource: 'LOCAL',
+      license: 'Apache-2.0',
+      contentText: '{"text":"capacity test dataset"}\n',
+    });
+    const capProduct = registerOrRepairProduct(db, {
+      name: 'Cap-Check-13B',
+      productClass: 'NG-BASE',
+      version: '1.0.0',
+      weightsSha256: crypto.createHash('sha256').update('cap-13b').digest('hex'),
+      architectureSummary: 'Transformer 13B GQA',
+      license: 'Apache-2.0',
+    });
+
     await assert.rejects(
       () =>
         createTrainingJob(db, {
-          modelId: 'PRD-TEST-13B',
-          datasetId: 'RES-DATA-01',
+          modelId: capProduct.id,
+          datasetId: capDs.resource.id,
           workerId: smallWorker.id,
           architecture: 'LoRA-13B',
           scaleTier: '13B',
@@ -239,7 +257,7 @@ test('Wing 2 (NEW MIND FACTORY): Capacity gating (1B-30B+), honest offline/onlin
     assert.equal(jobRes.job.trainingLoss, null);
     assert.equal(jobRes.job.currentStep, 0);
 
-    const paused = updateTrainingJobControl(db, jobRes.job.id, 'PAUSE');
+    const paused = await updateTrainingJobControl(db, jobRes.job.id, 'PAUSE');
     assert.equal(paused.jobStatus, 'PAUSED');
   } finally {
     if (mockServer) {
@@ -253,14 +271,14 @@ test('Wing 2 (NEW MIND FACTORY): Capacity gating (1B-30B+), honest offline/onlin
 test('Wings 3 + 4 + 5 End-to-End Flow: QC failure blocks approval/ZIP -> repair -> 10/10 PASS -> RELEASED -> Certified ZIP', () => {
   const { db, dir } = setupIsolatedWingsDb();
   try {
-    const validSha = crypto.createHash('sha256').update('ng-ilmf-model-weights-v2').digest('hex');
+    const fakeHexSha = crypto.createHash('sha256').update('ng-ilmf-model-weights-v2').digest('hex');
 
-    // 1. Register product with UNKNOWN license & missing provenance/checkpoint
+    // 1. Register product with UNKNOWN license & missing real binary weights/tokenizer/checkpoint
     const product = registerOrRepairProduct(db, {
       name: 'NG-Arabic-Instruct',
       productClass: 'NG-BASE',
       version: '1.0.0',
-      weightsSha256: validSha,
+      weightsSha256: fakeHexSha,
       architectureSummary: 'Transformer 7B GQA RoPE Arabic-English',
       license: 'UNKNOWN',
     });
@@ -272,30 +290,50 @@ test('Wings 3 + 4 + 5 End-to-End Flow: QC failure blocks approval/ZIP -> repair 
       /mandatory QC suites/,
     );
 
-    // 3. Running 10-suite QC against UNKNOWN license must NOT pass all 10
+    // 3. Running 10-suite QC against UNKNOWN license & missing weights MUST fail cleanly
     const failedQc = runTenSuiteQcCheck(db, product.id);
     assert.equal(failedQc.totalCount, 10);
     assert.equal(failedQc.allPassed, false);
-    const licenseRow = failedQc.reports.find((r) => r.testSuite === 'LICENSE_COMPLIANCE');
-    assert.equal(licenseRow?.result, 'FAIL');
+    assert.equal(failedQc.reports.find((r) => r.testSuite === 'LICENSE_COMPLIANCE')?.result, 'FAIL');
+    assert.equal(failedQc.reports.find((r) => r.testSuite === 'WEIGHTS_SHA256_INTEGRITY')?.result, 'FAIL');
+    assert.equal(failedQc.reports.find((r) => r.testSuite === 'TOKENIZER_CONSISTENCY')?.result, 'FAIL');
+    assert.equal(failedQc.reports.find((r) => r.testSuite === 'RESTORE_CHECKPOINT_PRESENT')?.result, 'FAIL');
 
     // Delivery ZIP blocked when not approved
     assert.throws(() => buildCertifiedDeliveryPackage(db, product.id), /Only APPROVED or RELEASED/);
 
-    // 4. Repair product in Wing 3 with clean license, provenance, safety review, evaluation & checkpoint
+    // 4. Materialize genuine NGWT binary weights, tokenizer.json, and model_config.json inside workspace
+    const mindArtifacts = initializeMindWeightsArtifact({
+      mindDir: path.join(dir, 'minds', product.id),
+      productId: product.id,
+      name: 'NG-Arabic-Instruct-Repaired',
+      productClass: 'NG-REPAIRED',
+      version: '1.1.0',
+      architecture: 'Transformer 7B GQA RoPE Arabic-English Repaired',
+      scaleTier: '7B',
+      parametersBillions: 7,
+      tokenizerSpec: 'NG-BPE-32K',
+      license: 'NG-COMMERCIAL',
+      corpusLines: ['الفيزياء الحديثة والرياضيات المتقدمة', 'NG-ILMF Sovereign Engineering Corpus'],
+    });
+
+    // Repair product in Wing 3 with real binary weights, tokenizer, config & checkpoint
     const repaired = registerOrRepairProduct(db, {
       id: product.id,
       name: 'NG-Arabic-Instruct-Repaired',
       productClass: 'NG-REPAIRED',
       version: '1.1.0',
-      weightsSha256: validSha,
+      weightsSha256: mindArtifacts.weightsSha256,
       architectureSummary: 'Transformer 7B GQA RoPE Arabic-English Repaired',
       trainingSummary: 'Cleaned STEM + Arabic Instruction fine-tune lineage verified',
       evaluationSummary: 'Evaluated on 10 Trust & Security QC suites with zero regressions',
       license: 'NG-COMMERCIAL',
-      safetyNotes: 'Passed red-team prompt safety policy inspection',
-      restoreCheckpointPath: '/checkpoints/ng_arabic_v1.0.0.ckpt',
-      changelog: 'Fixed license metadata, added restore checkpoint, verified SHA-256.',
+      safetyNotes: 'Passed red-team prompt safety policy inspection and binary check',
+      weightsPath: mindArtifacts.weightsPath,
+      tokenizerPath: mindArtifacts.tokenizerPath,
+      configPath: mindArtifacts.configPath,
+      restoreCheckpointPath: mindArtifacts.weightsPath,
+      changelog: 'Fixed license metadata, bundled NGWT binary weights & tokenizer, verified SHA-256.',
     });
     assert.equal(repaired.productClass, 'NG-REPAIRED');
 
@@ -310,7 +348,7 @@ test('Wings 3 + 4 + 5 End-to-End Flow: QC failure blocks approval/ZIP -> repair 
     const released = transitionProductLifecycle(db, repaired.id, 'RELEASED');
     assert.equal(released.lifecycleState, 'RELEASED');
 
-    // 7. Wing 5 builds real PKZIP delivery archive with verified SHA-256 digests
+    // 7. Wing 5 builds real PKZIP delivery archive containing real binary weights & verified SHA-256 digests
     const pkg = buildCertifiedDeliveryPackage(db, released.id);
     assert.equal(pkg.verified, true);
     assert.equal(pkg.packageSha256.length, 64);
@@ -318,15 +356,18 @@ test('Wings 3 + 4 + 5 End-to-End Flow: QC failure blocks approval/ZIP -> repair 
     assert.ok(fs.existsSync(pkg.zipPath));
 
     const zipBytes = fs.readFileSync(pkg.zipPath);
-    // Verify PKZIP magic header 0x50 0x4B 0x03 0x04 and contained files
     assert.equal(zipBytes[0], 0x50);
     assert.equal(zipBytes[1], 0x4b);
-    assert.equal(zipBytes[2], 0x03);
-    assert.equal(zipBytes[3], 0x04);
-    assert.equal(zipBytes.toString('utf-8').includes('MANIFEST.json'), true);
-    assert.equal(zipBytes.toString('utf-8').includes('TECHNICAL_REPORT.md'), true);
-    assert.equal(zipBytes.toString('utf-8').includes('LICENSE_AND_IP.txt'), true);
-    assert.equal(zipBytes.toString('utf-8').includes('CHECKSUMS.sha256'), true);
+    const extracted = extractAndVerifyZipArchive(zipBytes);
+    assert.equal(extracted.validStructure, true);
+    assert.equal(extracted.allCrcValid, true);
+    assert.ok(extracted.entries.has('MANIFEST.json'));
+    assert.ok(extracted.entries.has('TECHNICAL_REPORT.md'));
+    assert.ok(extracted.entries.has('LICENSE_AND_IP.txt'));
+    assert.ok(extracted.entries.has('CHECKSUMS.sha256'));
+    assert.ok(extracted.entries.has('weights/weights.ngbin'));
+    assert.ok(extracted.entries.has('tokenizer.json'));
+    assert.ok(extracted.entries.has('model_config.json'));
   } finally {
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });

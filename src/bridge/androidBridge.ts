@@ -5,6 +5,10 @@ export interface NativeAndroidBridgeInterface {
   verifySafUriPermissionsJson(uriString: string): string;
   runSafSha256ProbeJson(uriString: string): string;
   runSafSha256ProbeAsync?(requestId: string, uriString: string): void;
+  signAttestationChallengeJson?(challenge: string, safUri: string, probeSha256?: string): string;
+  writeSafArchiveFileJson?(treeUriString: string, categoryFolder: string, fileName: string, base64Content: string): string;
+  readVerifySafArchiveFileJson?(documentUriString: string, expectedSha256: string): string;
+  deleteSafDocumentJson?(documentUriString: string): string;
   revokeSafUriPermissionJson(uriString: string): string;
 }
 
@@ -180,6 +184,44 @@ export function runNativeSafSha256ProbeAsync(uriString: string): Promise<SafSha2
   });
 }
 
+export function signNativeAttestationChallenge(
+  challenge: string,
+  safUri: string,
+  probeSha256?: string,
+): { proofSignature: string; model?: string; sdkInt?: number } | null {
+  if (!isNativeAndroidWrapperAvailable() || !window.NgIlmfAndroidBridge?.signAttestationChallengeJson) {
+    return null;
+  }
+  try {
+    const raw = window.NgIlmfAndroidBridge.signAttestationChallengeJson(
+      challenge,
+      safUri,
+      probeSha256 ?? '',
+    );
+    return JSON.parse(raw) as { proofSignature: string; model?: string; sdkInt?: number };
+  } catch {
+    return null;
+  }
+}
+
+export function writeNativeSafArchiveFile(
+  treeUri: string,
+  categoryFolder: string,
+  fileName: string,
+  base64Content: string,
+): { ok: boolean; documentUri?: string; sha256?: string; sizeBytes?: number; error?: string } {
+  if (!isNativeAndroidWrapperAvailable() || !window.NgIlmfAndroidBridge?.writeSafArchiveFileJson) {
+    return { ok: false, error: 'Native Android SAF write bridge unavailable in host browser.' };
+  }
+  const raw = window.NgIlmfAndroidBridge.writeSafArchiveFileJson(
+    treeUri,
+    categoryFolder,
+    fileName,
+    base64Content,
+  );
+  return JSON.parse(raw) as { ok: boolean; documentUri?: string; sha256?: string; sizeBytes?: number; error?: string };
+}
+
 export function revokeNativeSafUri(uriString: string): { revoked: boolean; error?: string } {
   if (!isNativeAndroidWrapperAvailable() || !window.NgIlmfAndroidBridge) {
     return { revoked: true };
@@ -187,3 +229,4 @@ export function revokeNativeSafUri(uriString: string): { revoked: boolean; error
   const raw = window.NgIlmfAndroidBridge.revokeSafUriPermissionJson(uriString);
   return JSON.parse(raw) as { revoked: boolean; error?: string };
 }
+

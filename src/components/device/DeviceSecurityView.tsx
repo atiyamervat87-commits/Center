@@ -63,6 +63,7 @@ export function DeviceSecurityView({
 
   // Owner Security Auth Form State (no hardcoded default passkey!)
   const [passkeyInput, setPasskeyInput] = useState('');
+  const [bootstrapTokenInput, setBootstrapTokenInput] = useState('');
   const [deviceLabelInput, setDeviceLabelInput] = useState('OPPO CPH1911 Console');
   const [authBusy, setAuthBusy] = useState(false);
 
@@ -116,9 +117,11 @@ export function DeviceSecurityView({
       const res = await setupOwnerPasskey({
         passkey: passkeyInput,
         deviceLabel: deviceLabelInput,
+        ...(bootstrapTokenInput.trim() ? { bootstrapToken: bootstrapTokenInput.trim() } : {}),
       });
       setSecurity(res.snapshot);
       setPasskeyInput('');
+      setBootstrapTokenInput('');
       setFeedback({
         type: 'ok',
         text: `Owner Lock Active · Session ${res.sessionId}`,
@@ -547,7 +550,9 @@ export function DeviceSecurityView({
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="inline-flex items-center gap-1.5 text-emerald-800">
                     <UserCheck className="h-4 w-4" aria-hidden="true" />
-                    <span>SESSION AUTHENTICATED ({security.activeSessionId})</span>
+                    <span>
+                      SESSION AUTHENTICATED ({security.activeSessionId} · {security.activeRole ?? 'OWNER'})
+                    </span>
                   </span>
                   {security.activeSessionId && (
                     <button
@@ -565,7 +570,7 @@ export function DeviceSecurityView({
                 <span className="inline-flex items-center gap-1.5 text-amber-800">
                   <ShieldAlert className="h-4 w-4" aria-hidden="true" />
                   <span>
-                    {security.ownerLockConfigured ? 'LOCKED (SIGN IN REQUIRED)' : 'OPEN (NO PASSKEY SET)'}
+                    {security.ownerLockConfigured ? 'LOCKED (SIGN IN REQUIRED)' : 'LOCK UNCONFIGURED (SETUP REQUIRED)'}
                   </span>
                 </span>
               )}
@@ -592,18 +597,39 @@ export function DeviceSecurityView({
               </div>
 
               <label className="block space-y-1 text-xs">
-                <span className="font-semibold text-[#3B2419]">{copy.secPasskeyLabel}</span>
+                <span className="font-semibold text-[#3B2419]">
+                  {copy.secPasskeyLabel} {isAr ? '(8 أحرف على الأقل)' : '(min 8 chars)'}
+                </span>
                 <input
                   type="password"
                   required
-                  minLength={6}
+                  minLength={8}
                   autoComplete="off"
                   value={passkeyInput}
                   onChange={(e) => setPasskeyInput(e.target.value)}
-                  placeholder="••••••"
+                  placeholder="••••••••"
                   className="w-full min-h-[44px] px-3 py-2 rounded-lg bg-white border border-[#523624]/25 font-mono text-xs text-[#26170F] focus:outline-2 focus:outline-[#B8860B]"
                 />
               </label>
+
+              {!security.ownerLockConfigured && (
+                <label className="block space-y-1 text-xs">
+                  <span className="font-semibold text-[#3B2419]">
+                    {isAr
+                      ? 'رمز التمهيد (Bootstrap Token — إلزامي للوصول الشبكي)'
+                      : 'Bootstrap Token (required for remote setup / env token)'}
+                  </span>
+                  <input
+                    type="password"
+                    required={Boolean(security.bootstrapTokenRequired)}
+                    autoComplete="off"
+                    value={bootstrapTokenInput}
+                    onChange={(e) => setBootstrapTokenInput(e.target.value)}
+                    placeholder={isAr ? 'اتركه فارغًا في التشغيل المحلي إلا إذا عُيّن' : 'From .bootstrap_token or NG_ILMF_BOOTSTRAP_TOKEN'}
+                    className="w-full min-h-[44px] px-3 py-2 rounded-lg bg-white border border-[#523624]/25 font-mono text-xs text-[#26170F] focus:outline-2 focus:outline-[#B8860B]"
+                  />
+                </label>
+              )}
 
               <label className="block space-y-1 text-xs">
                 <span className="font-semibold text-[#3B2419]">{copy.secDeviceLabel}</span>

@@ -3,6 +3,8 @@ import { getConfigMap } from '../db/database.ts';
 import { listAuditLogs } from '../audit/auditService.ts';
 import { probeDeviceEnvironment } from '../storage/storageProbe.ts';
 import { computeAndroidBridgeDiagnostics } from '../storage/androidBridgeDiagnostic.ts';
+import { sanitizeConfigForClient } from './securityService.ts';
+import { assertWorkerUrlSafeBeforeFetch } from '../utils/urlSecurity.ts';
 import {
   collectPerformanceMetrics,
   collectTrainingMetrics,
@@ -53,9 +55,10 @@ export async function probeTrainingBridge(endpointUrl: string): Promise<BridgeHe
 
   const start = Date.now();
   try {
+    const safeBase = await assertWorkerUrlSafeBeforeFetch(trimmed);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1800);
-    const healthUrl = trimmed.endsWith('/') ? `${trimmed}health` : `${trimmed}/health`;
+    const healthUrl = `${safeBase}/health`;
     const response = await fetch(healthUrl, {
       method: 'GET',
       signal: controller.signal,
@@ -66,7 +69,7 @@ export async function probeTrainingBridge(endpointUrl: string): Promise<BridgeHe
     if (response.ok) {
       return {
         configured: true,
-        endpointUrl: trimmed,
+        endpointUrl: safeBase,
         status: 'ONLINE',
         latencyMs,
         detail: `HTTP ${response.status} verified`,
@@ -76,7 +79,7 @@ export async function probeTrainingBridge(endpointUrl: string): Promise<BridgeHe
 
     return {
       configured: true,
-      endpointUrl: trimmed,
+      endpointUrl: safeBase,
       status: 'WARNING',
       latencyMs,
       detail: `Worker responded with HTTP ${response.status}`,
@@ -390,7 +393,7 @@ export async function getMasterDashboardSnapshot(db: DatabaseSync) {
     syncMetadata,
     environment,
     androidDiagnostics,
-    config,
+    config: sanitizeConfigForClient(config),
     recentAuditLogs,
     modules: getArchitectureModules(),
   };

@@ -4,6 +4,12 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { getConfigMap } from '../db/database.ts';
 import { recordAuditEvent } from '../audit/auditService.ts';
+import {
+  inspectBinaryWeightsBuffer,
+  inspectBinaryWeightsFile,
+  repairBinaryWeightsFile,
+} from '../ml/neuralMindEngine.ts';
+import { resolveSafeRealPath, writeFileAtomic } from '../utils/fsAtomic.ts';
 
 export type NgProductClass =
   | 'NG-BASE'
@@ -153,6 +159,9 @@ export function registerOrRepairProduct(
     license: string;
     safetyNotes?: string;
     restoreCheckpointPath?: string;
+    weightsPath?: string;
+    tokenizerPath?: string;
+    configPath?: string;
     changelog?: string;
   },
 ): ModelProductRecord {
@@ -172,12 +181,30 @@ export function registerOrRepairProduct(
     throw new Error('weightsSha256 must be a valid 64-character lowercase SHA-256 hex digest');
   }
 
+  const config = getConfigMap(db);
+  const dataDir = path.resolve(config.data_dir || process.cwd());
+
+  const validateOptionalWorkspacePath = (rawPath: string | undefined, label: string): string | null => {
+    const trimmed = (rawPath ?? '').trim();
+    if (!trimmed) return null;
+    const check = resolveSafeRealPath(trimmed, dataDir);
+    if (!check.allowed) {
+      throw new Error(`Blocked: ${label} must reside inside managed data_dir.`);
+    }
+    return check.canonicalTarget;
+  };
+
+  const validatedRestorePath = validateOptionalWorkspacePath(input.restoreCheckpointPath, 'restoreCheckpointPath');
+  const validatedWeightsPath = validateOptionalWorkspacePath(input.weightsPath, 'weightsPath');
+  const validatedTokenizerPath = validateOptionalWorkspacePath(input.tokenizerPath, 'tokenizerPath');
+  const validatedConfigPath = validateOptionalWorkspacePath(input.configPath, 'configPath');
+
   const now = new Date().toISOString();
   const safetyReport = {
     reviewedBy: 'OWNER',
     reviewedAt: now,
     notes: (input.safetyNotes ?? '').trim() || 'Safety review recorded in Trust Center',
-    restoreCheckpointPath: (input.restoreCheckpointPath ?? '').trim() || null,
+    restoreCheckpointPath: validatedRestorePath,
   };
 
   if (input.id) {
@@ -185,8 +212,6 @@ export function registerOrRepairProduct(
     if (!existing) throw new Error(`Product not found: ${input.id}`);
 
     // MANDATORY GUARANTEE: Preserve immutable snapshot of pre-repair state before editing
-    const config = getConfigMap(db);
-    const dataDir = path.resolve(config.data_dir || process.cwd());
     const backupDir = path.join(dataDir, 'repair_vault', 'backups');
     fs.mkdirSync(backupDir, { recursive: true });
     const backupFile = path.join(
@@ -207,7 +232,7 @@ export function registerOrRepairProduct(
       originalSafetyReport: existing.safetyReport,
     };
     const snapshotJson = JSON.stringify(preRepairSnapshot, null, 2);
-    fs.writeFileSync(backupFile, snapshotJson, 'utf-8');
+    writeFileAtomic(backupFile, snapshotJson, 'utf-8');
     const backupSha256 = crypto.createHash('sha256').update(snapshotJson, 'utf-8').digest('hex');
 
     const prevOriginals = Array.isArray(existing.safetyReport.preservedOriginals)
@@ -222,21 +247,33 @@ export function registerOrRepairProduct(
       preservedAt: now,
     };
 
+    const mergedRuntimeRequirements: Record<string, unknown> = {
+      ...existing.runtimeRequirements,
+      ...(validatedRestorePath ? { restoreCheckpointPath: validatedRestorePath } : {}),
+      ...(validatedWeightsPath ? { weightsPath: validatedWeightsPath } : {}),
+      ...(validatedTokenizerPath ? { tokenizerPath: validatedTokenizerPath } : {}),
+      ...(validatedConfigPath ? { configPath: validatedConfigPath } : {}),
+    };
+    if (!mergedRuntimeRequirements.restoreCheckpointPath) {
+      mergedRuntimeRequirements.restoreCheckpointPath = backupFile;
+    }
+
     const mergedSafetyReport = {
       ...safetyReport,
       originalBackup: existing.safetyReport.originalBackup ?? preservedOriginalRecord,
       preservedOriginals: [...prevOriginals, preservedOriginalRecord],
-      restoreCheckpointPath:
-        (input.restoreCheckpointPath ?? '').trim() || backupFile,
+      restoreCheckpointPath: validatedRestorePath || backupFile,
     };
 
-    // Modifying weights/repair resets lifecycle back to EVALUATION until QC passes again
+    // Modifying weights/repair MUST invalidate stale QC passes & reset lifecycle back to EVALUATION
+    db.prepare('DELETE FROM qc_reports WHERE product_id = ?').run(input.id);
+
     db.prepare(
       `
       UPDATE model_products
       SET name = ?, product_class = ?, version = ?, weights_sha256 = ?,
           architecture_summary = ?, training_summary = ?, evaluation_summary = ?,
-          license = ?, safety_report_json = ?, changelog = ?,
+          license = ?, runtime_requirements_json = ?, safety_report_json = ?, changelog = ?,
           lifecycle_state = 'EVALUATION', updated_at = ?
       WHERE id = ?
     `,
@@ -249,6 +286,7 @@ export function registerOrRepairProduct(
       (input.trainingSummary ?? existing.trainingSummary).trim(),
       (input.evaluationSummary ?? existing.evaluationSummary).trim(),
       license,
+      JSON.stringify(mergedRuntimeRequirements),
       JSON.stringify(mergedSafetyReport),
       (input.changelog ?? existing.changelog).trim(),
       now,
@@ -266,6 +304,7 @@ export function registerOrRepairProduct(
         weightsSha256,
         preservedBackupFile: backupFile,
         backupSha256,
+        staleQcInvalidated: true,
       },
     });
 
@@ -273,9 +312,12 @@ export function registerOrRepairProduct(
   }
 
   const id = `PRD-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-  const runtimeRequirements = {
+  const runtimeRequirements: Record<string, unknown> = {
     scaleTier: '1B',
-    restoreCheckpointPath: (input.restoreCheckpointPath ?? '').trim() || null,
+    restoreCheckpointPath: validatedRestorePath,
+    ...(validatedWeightsPath ? { weightsPath: validatedWeightsPath } : {}),
+    ...(validatedTokenizerPath ? { tokenizerPath: validatedTokenizerPath } : {}),
+    ...(validatedConfigPath ? { configPath: validatedConfigPath } : {}),
   };
 
   db.prepare(
@@ -316,6 +358,230 @@ export function registerOrRepairProduct(
   return listModelProducts(db).find((p) => p.id === id)!;
 }
 
+/**
+ * Executes real tensor-level repair or INT8 quantization over NGWT binary weights,
+ * preserves the immutable pre-repair artifact, updates weights_sha256, and invalidates stale QC.
+ */
+export function executeModelRepair(
+  db: DatabaseSync,
+  input: {
+    productId: string;
+    operation: 'SANITIZE_NAN_INF' | 'INT8_QUANTIZE';
+    newVersion: string;
+    productClass?: NgProductClass;
+    license?: string;
+    safetyNotes?: string;
+    changelog?: string;
+  },
+): {
+  product: ModelProductRecord;
+  repairedWeightsPath: string;
+  weightsSha256: string;
+  operation: 'SANITIZE_NAN_INF' | 'INT8_QUANTIZE';
+  nanFixedCount: number;
+  dtype: 'f32' | 'i8';
+} {
+  const existing = listModelProducts(db).find((p) => p.id === input.productId);
+  if (!existing) throw new Error(`Product not found: ${input.productId}`);
+
+  const newVersion = input.newVersion.trim();
+  if (!newVersion) throw new Error('newVersion is required');
+
+  const config = getConfigMap(db);
+  const dataDir = path.resolve(config.data_dir || process.cwd());
+
+  const candidatePaths: string[] = [];
+  if (typeof existing.runtimeRequirements.weightsPath === 'string') {
+    candidatePaths.push(existing.runtimeRequirements.weightsPath);
+  }
+  if (
+    typeof existing.safetyReport.originalBackup === 'object' &&
+    existing.safetyReport.originalBackup !== null &&
+    typeof (existing.safetyReport.originalBackup as { backupPath?: unknown }).backupPath === 'string'
+  ) {
+    candidatePaths.push((existing.safetyReport.originalBackup as { backupPath: string }).backupPath);
+  }
+  const matchingRes = db
+    .prepare('SELECT file_path FROM resources WHERE sha256 = ?')
+    .get(existing.weightsSha256) as { file_path: string } | undefined;
+  if (matchingRes?.file_path) {
+    candidatePaths.push(matchingRes.file_path);
+  }
+
+  let sourceWeightsPath = '';
+  for (const cand of candidatePaths) {
+    const safeCheck = resolveSafeRealPath(cand, dataDir);
+    if (safeCheck.allowed && fs.existsSync(safeCheck.canonicalTarget) && fs.statSync(safeCheck.canonicalTarget).isFile()) {
+      const inspection = inspectBinaryWeightsFile(safeCheck.canonicalTarget);
+      if (inspection.detectedFormat === 'NGWT-V1') {
+        sourceWeightsPath = safeCheck.canonicalTarget;
+        break;
+      }
+    }
+  }
+
+  if (!sourceWeightsPath) {
+    throw new Error(
+      `Blocked: Product ${input.productId} lacks a mutable NGWT-V1 binary weights container inside data_dir for ${input.operation}.`,
+    );
+  }
+
+  const now = new Date().toISOString();
+  const backupDir = path.join(dataDir, 'repair_vault', 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const preRepairSnapshotPath = path.join(
+    backupDir,
+    `${existing.id}_v${existing.version.replace(/[^a-zA-Z0-9._-]/g, '_')}_pre_${input.operation}_${Date.now()}.json`,
+  );
+  const preRepairSnapshot = {
+    preservedAt: now,
+    productId: existing.id,
+    sourceWeightsPath,
+    originalVersion: existing.version,
+    originalWeightsSha256: existing.weightsSha256,
+  };
+  const preSnapJson = JSON.stringify(preRepairSnapshot, null, 2);
+  writeFileAtomic(preRepairSnapshotPath, preSnapJson, 'utf-8');
+  const backupSha256 = crypto.createHash('sha256').update(preSnapJson, 'utf-8').digest('hex');
+
+  const repairedDir = path.join(dataDir, 'repair_vault', 'repaired', existing.id);
+  fs.mkdirSync(repairedDir, { recursive: true });
+  const repairedWeightsPath = path.join(
+    repairedDir,
+    `weights_v${newVersion.replace(/[^a-zA-Z0-9._-]/g, '_')}.ngbin`,
+  );
+
+  const repairedResult = repairBinaryWeightsFile({
+    sourceWeightsPath,
+    outputWeightsPath: repairedWeightsPath,
+    newVersion,
+    operation: input.operation,
+  });
+
+  // Preserve/update model_config.json if linked
+  let updatedConfigPath =
+    typeof existing.runtimeRequirements.configPath === 'string'
+      ? existing.runtimeRequirements.configPath
+      : null;
+  if (updatedConfigPath) {
+    const cfgCheck = resolveSafeRealPath(updatedConfigPath, dataDir);
+    if (cfgCheck.allowed && fs.existsSync(cfgCheck.canonicalTarget)) {
+      try {
+        const cfgObj = JSON.parse(fs.readFileSync(cfgCheck.canonicalTarget, 'utf-8')) as Record<string, unknown>;
+        cfgObj.version = newVersion;
+        cfgObj.weightsFile = repairedWeightsPath;
+        cfgObj.weightsSha256 = repairedResult.weightsSha256;
+        cfgObj.dtype = repairedResult.dtype;
+        cfgObj.repairedAt = now;
+        const repairedCfgPath = path.join(repairedDir, 'model_config.json');
+        writeFileAtomic(repairedCfgPath, JSON.stringify(cfgObj, null, 2), 'utf-8');
+        updatedConfigPath = repairedCfgPath;
+      } catch {
+        // leave existing configPath untouched if unreadable
+      }
+    }
+  }
+
+  const nextClass: NgProductClass =
+    input.productClass && VALID_CLASSES.has(input.productClass)
+      ? input.productClass
+      : input.operation === 'INT8_QUANTIZE'
+        ? 'NG-QUANTIZED'
+        : 'NG-REPAIRED';
+  const nextLicense = (input.license ?? existing.license).trim() || existing.license;
+
+  const prevOriginals = Array.isArray(existing.safetyReport.preservedOriginals)
+    ? (existing.safetyReport.preservedOriginals as Array<Record<string, unknown>>)
+    : [];
+  const nextSafetyReport = {
+    reviewedBy: 'OWNER',
+    reviewedAt: now,
+    notes:
+      (input.safetyNotes ?? '').trim() ||
+      `Executed ${input.operation} binary weight repair (${repairedResult.nanFixedCount} non-finite values fixed, dtype=${repairedResult.dtype})`,
+    restoreCheckpointPath: sourceWeightsPath,
+    originalBackup: existing.safetyReport.originalBackup ?? {
+      version: existing.version,
+      weightsSha256: existing.weightsSha256,
+      backupPath: sourceWeightsPath,
+      preservedAt: now,
+    },
+    preservedOriginals: [
+      ...prevOriginals,
+      {
+        version: existing.version,
+        weightsSha256: existing.weightsSha256,
+        backupPath: preRepairSnapshotPath,
+        backupSha256,
+        preservedAt: now,
+      },
+    ],
+  };
+
+  const nextRuntimeReq: Record<string, unknown> = {
+    ...existing.runtimeRequirements,
+    weightsPath: repairedWeightsPath,
+    weightsManifestPath: repairedWeightsPath,
+    restoreCheckpointPath: sourceWeightsPath,
+    hasBinaryWeights: true,
+    dtype: repairedResult.dtype,
+    tensorCount: repairedResult.tensorCount,
+    containerParameters: repairedResult.parameterCount,
+    ...(updatedConfigPath ? { configPath: updatedConfigPath } : {}),
+  };
+
+  // Invalidate any stale QC passes whenever binary weights change
+  db.prepare('DELETE FROM qc_reports WHERE product_id = ?').run(existing.id);
+
+  db.prepare(
+    `
+    UPDATE model_products
+    SET product_class = ?, version = ?, weights_sha256 = ?,
+        evaluation_summary = ?, license = ?,
+        runtime_requirements_json = ?, safety_report_json = ?, changelog = ?,
+        lifecycle_state = 'EVALUATION', updated_at = ?
+    WHERE id = ?
+  `,
+  ).run(
+    nextClass,
+    newVersion,
+    repairedResult.weightsSha256,
+    `Binary repair ${input.operation} completed (${repairedResult.nanFixedCount} NaN/Inf fixed; dtype=${repairedResult.dtype})`,
+    nextLicense,
+    JSON.stringify(nextRuntimeReq),
+    JSON.stringify(nextSafetyReport),
+    (input.changelog ?? '').trim() || `v${newVersion}: ${input.operation} applied over ${sourceWeightsPath}`,
+    now,
+    existing.id,
+  );
+
+  recordAuditEvent(db, {
+    actor: 'OWNER',
+    category: 'REPAIR_FACTORY',
+    action: `EXECUTE_BINARY_REPAIR_${input.operation}`,
+    target: `${existing.id} -> v${newVersion}`,
+    outcome: 'PASS',
+    details: {
+      sourceWeightsPath,
+      repairedWeightsPath,
+      weightsSha256: repairedResult.weightsSha256,
+      nanFixedCount: repairedResult.nanFixedCount,
+      dtype: repairedResult.dtype,
+      staleQcInvalidated: true,
+    },
+  });
+
+  const updatedProduct = listModelProducts(db).find((p) => p.id === existing.id)!;
+  return {
+    product: updatedProduct,
+    repairedWeightsPath,
+    weightsSha256: repairedResult.weightsSha256,
+    operation: input.operation,
+    nanFixedCount: repairedResult.nanFixedCount,
+    dtype: repairedResult.dtype,
+  };
+}
+
 export function transitionProductLifecycle(
   db: DatabaseSync,
   productId: string,
@@ -327,13 +593,25 @@ export function transitionProductLifecycle(
   const product = listModelProducts(db).find((p) => p.id === productId);
   if (!product) throw new Error(`Product not found: ${productId}`);
 
-  // STRICT SAFETY GATE: Cannot approve or release any model unless all 10 QC suites passed!
+  // STRICT SAFETY GATE: Cannot approve or release any model unless all 10 QC suites passed FOR CURRENT VERSION & WEIGHTS!
   if (nextState === 'APPROVED' || nextState === 'RELEASED') {
     const passedRows = db
-      .prepare("SELECT COUNT(DISTINCT test_suite) AS count FROM qc_reports WHERE product_id = ? AND result = 'PASS'")
-      .get(productId) as { count: number };
+      .prepare("SELECT test_suite, details_json FROM qc_reports WHERE product_id = ? AND result = 'PASS'")
+      .all(productId) as unknown as Array<{ test_suite: string; details_json: string }>;
 
-    if (passedRows.count < REQUIRED_QC_SUITES_COUNT) {
+    const matchedSuites = new Set<string>();
+    for (const r of passedRows) {
+      try {
+        const d = JSON.parse(r.details_json) as { productVersion?: string; weightsSha256?: string };
+        if (d.productVersion === product.version && d.weightsSha256 === product.weightsSha256) {
+          matchedSuites.add(r.test_suite);
+        }
+      } catch {
+        // ignore unparseable detail row
+      }
+    }
+
+    if (matchedSuites.size < REQUIRED_QC_SUITES_COUNT) {
       recordAuditEvent(db, {
         actor: 'OWNER',
         category: 'SECURITY',
@@ -342,12 +620,12 @@ export function transitionProductLifecycle(
         outcome: 'BLOCKED',
         details: {
           attemptedState: nextState,
-          passedSuites: passedRows.count,
+          passedSuitesForCurrentWeights: matchedSuites.size,
           requiredSuites: REQUIRED_QC_SUITES_COUNT,
         },
       });
       throw new Error(
-        `Blocked: Product ${productId} passed ${passedRows.count}/${REQUIRED_QC_SUITES_COUNT} mandatory QC suites. Execute and pass all 10 Trust & QC suites before ${nextState}.`,
+        `Blocked: Product ${productId} passed ${matchedSuites.size}/${REQUIRED_QC_SUITES_COUNT} mandatory QC suites for current weights/version. Execute and pass all 10 Trust & QC suites before ${nextState}.`,
       );
     }
 
@@ -384,6 +662,7 @@ export function receiveExternalModelForRepair(
     license: string;
     architectureSummary: string;
     weightsPath?: string;
+    tokenizerPath?: string;
     fileName?: string;
     fileBase64?: string;
     contentText?: string;
@@ -396,6 +675,9 @@ export function receiveExternalModelForRepair(
     sha256Valid: boolean;
     sizeBytes: number;
     licenseCompliant: boolean;
+    hasBinaryWeights: boolean;
+    detectedFormat: string;
+    nonFiniteCount: number;
     warnings: string[];
   };
 } {
@@ -408,16 +690,23 @@ export function receiveExternalModelForRepair(
     throw new Error('name and architectureSummary are required');
   }
 
+  const config = getConfigMap(db);
+  const dataDir = path.resolve(config.data_dir || process.cwd());
+
   let rawBuf: Buffer;
-  let sourceFileName = input.fileName?.trim() || `${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '_')}.model.json`;
+  let sourceFileName = input.fileName?.trim() || `${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '_')}.ngbin`;
 
   if (input.weightsPath?.trim()) {
-    const resolved = input.weightsPath.trim();
-    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-      throw new Error(`External model file not found on disk: ${resolved}`);
+    const resolved = path.resolve(input.weightsPath.trim());
+    const safeCheck = resolveSafeRealPath(resolved, dataDir);
+    if (!safeCheck.allowed) {
+      throw new Error(`Blocked: weightsPath must reside inside managed data_dir (${dataDir}).`);
     }
-    rawBuf = fs.readFileSync(resolved);
-    sourceFileName = path.basename(resolved);
+    if (!fs.existsSync(safeCheck.canonicalTarget) || !fs.statSync(safeCheck.canonicalTarget).isFile()) {
+      throw new Error(`External model file not found on disk: ${safeCheck.canonicalTarget}`);
+    }
+    rawBuf = fs.readFileSync(safeCheck.canonicalTarget);
+    sourceFileName = path.basename(safeCheck.canonicalTarget);
   } else if (input.fileBase64?.trim()) {
     rawBuf = Buffer.from(input.fileBase64.trim(), 'base64');
   } else if (input.contentText?.trim()) {
@@ -430,25 +719,42 @@ export function receiveExternalModelForRepair(
     throw new Error('External model payload is empty');
   }
 
+  let validatedTokenizerPath: string | null = null;
+  if (input.tokenizerPath?.trim()) {
+    const tokCheck = resolveSafeRealPath(input.tokenizerPath.trim(), dataDir);
+    if (!tokCheck.allowed || !fs.existsSync(tokCheck.canonicalTarget)) {
+      throw new Error('Supplied tokenizerPath must exist inside managed data_dir.');
+    }
+    validatedTokenizerPath = tokCheck.canonicalTarget;
+  }
+
   const originalSha256 = crypto.createHash('sha256').update(rawBuf).digest('hex');
   const productId = `PRD-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-  const config = getConfigMap(db);
-  const dataDir = path.resolve(config.data_dir || process.cwd());
   const originalDir = path.join(dataDir, 'repair_vault', 'originals', productId);
   fs.mkdirSync(originalDir, { recursive: true });
 
-  const originalBackupPath = path.join(originalDir, `ORIGINAL_${sourceFileName}`);
-  fs.writeFileSync(originalBackupPath, rawBuf);
+  const safeBaseName = path.basename(sourceFileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const originalBackupPath = path.join(originalDir, `ORIGINAL_${safeBaseName}`);
+  writeFileAtomic(originalBackupPath, rawBuf);
   const verifyCopySha = crypto.createHash('sha256').update(fs.readFileSync(originalBackupPath)).digest('hex');
   if (verifyCopySha !== originalSha256) {
     throw new Error('Failed to verify immutable original copy in repair vault');
   }
 
+  const binaryInspection = inspectBinaryWeightsBuffer(rawBuf, originalBackupPath);
+
   const disallowed = new Set(['', 'UNKNOWN', 'NONE', 'UNLICENSED', 'N/A']);
   const licenseCompliant = !disallowed.has(license.toUpperCase());
   const warnings: string[] = [];
   if (!licenseCompliant) warnings.push(`License '${license}' requires review before approval`);
-  if (rawBuf.length < 32) warnings.push('Very small weights/metadata payload size');
+  if (!binaryInspection.isBinaryWeights) {
+    warnings.push(
+      binaryInspection.reason || `Artifact format '${binaryInspection.detectedFormat}' is not verified binary weights`,
+    );
+  }
+  if (binaryInspection.nonFiniteCount > 0) {
+    warnings.push(`Detected ${binaryInspection.nonFiniteCount} NaN/Inf tensor values requiring SANITIZE_NAN_INF repair`);
+  }
 
   const now = new Date().toISOString();
   const safetyReport = {
@@ -474,6 +780,20 @@ export function receiveExternalModelForRepair(
     ],
   };
 
+  const runtimeRequirements = {
+    restoreCheckpointPath: originalBackupPath,
+    sizeBytes: rawBuf.length,
+    hasBinaryWeights: binaryInspection.isBinaryWeights,
+    weightsPath: binaryInspection.isBinaryWeights ? originalBackupPath : null,
+    ...(validatedTokenizerPath ? { tokenizerPath: validatedTokenizerPath } : {}),
+    binaryInspection: {
+      detectedFormat: binaryInspection.detectedFormat,
+      tensorCount: binaryInspection.tensorCount,
+      parameterCount: binaryInspection.parameterCount,
+      nonFiniteCount: binaryInspection.nonFiniteCount,
+    },
+  };
+
   db.prepare(
     `
     INSERT INTO model_products (
@@ -490,9 +810,9 @@ export function receiveExternalModelForRepair(
     originalSha256,
     architectureSummary,
     `External repair intake from ${originSource}`,
-    `Pre-repair inspection completed (${warnings.length} warnings)`,
+    `Pre-repair inspection completed (${warnings.length} warnings; format=${binaryInspection.detectedFormat})`,
     license,
-    JSON.stringify({ restoreCheckpointPath: originalBackupPath, sizeBytes: rawBuf.length }),
+    JSON.stringify(runtimeRequirements),
     JSON.stringify(safetyReport),
     `Original model preserved at ${originalBackupPath}`,
     now,
@@ -505,7 +825,15 @@ export function receiveExternalModelForRepair(
     action: 'RECEIVE_AND_PRESERVE_EXTERNAL_MODEL',
     target: `${productId} -> ${originalBackupPath}`,
     outcome: warnings.length > 0 ? 'WARNING' : 'PASS',
-    details: { originalSha256, sizeBytes: rawBuf.length, licenseCompliant, warnings },
+    details: {
+      originalSha256,
+      sizeBytes: rawBuf.length,
+      licenseCompliant,
+      hasBinaryWeights: binaryInspection.isBinaryWeights,
+      detectedFormat: binaryInspection.detectedFormat,
+      nonFiniteCount: binaryInspection.nonFiniteCount,
+      warnings,
+    },
   });
 
   const product = listModelProducts(db).find((p) => p.id === productId)!;
@@ -517,6 +845,9 @@ export function receiveExternalModelForRepair(
       sha256Valid: true,
       sizeBytes: rawBuf.length,
       licenseCompliant,
+      hasBinaryWeights: binaryInspection.isBinaryWeights,
+      detectedFormat: binaryInspection.detectedFormat,
+      nonFiniteCount: binaryInspection.nonFiniteCount,
       warnings,
     },
   };

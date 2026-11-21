@@ -5,12 +5,15 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.util.Base64
 import android.webkit.JavascriptInterface
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 class SafStorageBridge(
     private val context: Context,
@@ -48,6 +51,25 @@ class SafStorageBridge(
             put("sdkInt", Build.VERSION.SDK_INT)
             put("termuxPackageInstalled", termuxInstalled)
             put("persistedUriPermissions", urisArray)
+        }.toString()
+    }
+
+    @JavascriptInterface
+    fun signAttestationChallengeJson(
+        challenge: String,
+        safUri: String,
+        probeSha256: String?
+    ): String {
+        val message = "${Build.MODEL}|${Build.VERSION.SDK_INT}|${safUri.trim()}|${probeSha256?.trim().orEmpty()}|${challenge.trim()}"
+        val mac = Mac.getInstance("HmacSHA256")
+        val keySpec = SecretKeySpec(challenge.trim().toByteArray(Charsets.UTF_8), "HmacSHA256")
+        mac.init(keySpec)
+        val signatureHex = mac.doFinal(message.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return JSONObject().apply {
+            put("proofSignature", signatureHex)
+            put("model", Build.MODEL)
+            put("sdkInt", Build.VERSION.SDK_INT)
         }.toString()
     }
 
@@ -196,7 +218,6 @@ class SafStorageBridge(
                     put("failureReason", "SHA-256 mismatch after reading back SAF temporary file")
                 }.toString()
             } else {
-                // Delete ONLY the temporary probe file after verification succeeds
                 val deleted = tempDoc.delete()
                 JSONObject().apply {
                     put("isNativeAndroidExecution", true)
@@ -214,6 +235,11 @@ class SafStorageBridge(
                 }.toString()
             }
         } catch (ex: Exception) {
+            val cleaned = try {
+                tempDoc.delete()
+            } catch (_: Exception) {
+                false
+            }
             JSONObject().apply {
                 put("isNativeAndroidExecution", true)
                 put("uri", uriString)
@@ -222,8 +248,105 @@ class SafStorageBridge(
                 put("storageReady", false)
                 put("expectedSha256", expectedSha256)
                 put("contentMatched", false)
-                put("cleanupCompleted", false)
+                put("cleanupCompleted", cleaned)
                 put("failureReason", ex.message ?: "SAF I/O exception")
+            }.toString()
+        }
+    }
+
+    @JavascriptInterface
+    fun writeSafArchiveFileJson(
+        treeUriString: String,
+        categoryFolder: String,
+        fileName: String,
+        base64Content: String
+    ): String {
+        val permCheck = JSONObject(verifySafUriPermissionsJson(treeUriString))
+        if (!permCheck.optBoolean("authorized", false)) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("error", permCheck.optString("reason", "SAF URI not authorized"))
+            }.toString()
+        }
+        return try {
+            val rootTree = DocumentFile.fromTreeUri(context, Uri.parse(treeUriString))
+                ?: throw IllegalStateException("SAF tree root unavailable")
+            val safeRoot = rootTree.findFile("NG-ILMF_ARCHIVE")
+                ?: rootTree.createDirectory("NG-ILMF_ARCHIVE")
+                ?: throw IllegalStateException("Cannot initialize NG-ILMF_ARCHIVE via SAF")
+            val safeCategory = categoryFolder.replace(Regex("[^A-Z0-9_]"), "_").ifBlank { "INVENTORY" }
+            val catDir = safeRoot.findFile(safeCategory)
+                ?: safeRoot.createDirectory(safeCategory)
+                ?: throw IllegalStateException("Cannot create SAF category directory $safeCategory")
+
+            val cleanName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            catDir.findFile(cleanName)?.delete()
+            val targetDoc = catDir.createFile("application/octet-stream", cleanName)
+                ?: throw IllegalStateException("DocumentFile.createFile failed for $cleanName")
+
+            val bytes = Base64.decode(base64Content, Base64.DEFAULT)
+            context.contentResolver.openOutputStream(targetDoc.uri, "wt")?.use { out ->
+                out.write(bytes)
+                out.flush()
+            } ?: throw IllegalStateException("Failed to open SAF output stream")
+
+            val readBack = context.contentResolver.openInputStream(targetDoc.uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("Failed to read back SAF archive entry")
+            val sha = sha256Hex(readBack)
+            val expectedSha = sha256Hex(bytes)
+
+            JSONObject().apply {
+                put("ok", sha == expectedSha)
+                put("documentUri", targetDoc.uri.toString())
+                put("sha256", sha)
+                put("sizeBytes", readBack.size)
+            }.toString()
+        } catch (ex: Exception) {
+            JSONObject().apply {
+                put("ok", false)
+                put("error", ex.message ?: "SAF write failed")
+            }.toString()
+        }
+    }
+
+    @JavascriptInterface
+    fun readVerifySafArchiveFileJson(
+        documentUriString: String,
+        expectedSha256: String
+    ): String {
+        return try {
+            val docUri = Uri.parse(documentUriString)
+            val bytes = context.contentResolver.openInputStream(docUri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("Document unreadable or missing")
+            val actualSha = sha256Hex(bytes)
+            JSONObject().apply {
+                put("exists", true)
+                put("sha256", actualSha)
+                put("matched", actualSha == expectedSha256.lowercase())
+                put("sizeBytes", bytes.size)
+            }.toString()
+        } catch (ex: Exception) {
+            JSONObject().apply {
+                put("exists", false)
+                put("matched", false)
+                put("error", ex.message ?: "SAF verify failed")
+            }.toString()
+        }
+    }
+
+    @JavascriptInterface
+    fun deleteSafDocumentJson(documentUriString: String): String {
+        return try {
+            val doc = DocumentFile.fromSingleUri(context, Uri.parse(documentUriString))
+            val deleted = doc?.delete() == true
+            JSONObject().apply {
+                put("deleted", deleted)
+                put("uri", documentUriString)
+            }.toString()
+        } catch (ex: Exception) {
+            JSONObject().apply {
+                put("deleted", false)
+                put("error", ex.message ?: "SAF delete failed")
             }.toString()
         }
     }

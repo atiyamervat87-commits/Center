@@ -5,6 +5,10 @@ import { getDefaultRuntimeConfig } from '../config/runtime.ts';
 
 let dbInstance: DatabaseSync | null = null;
 
+export function setDatabaseForTests(db: DatabaseSync | null): void {
+  dbInstance = db;
+}
+
 export function getDatabase(): DatabaseSync {
   if (dbInstance) {
     return dbInstance;

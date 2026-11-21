@@ -8,6 +8,7 @@ import { probeDeviceEnvironment, runProviderIntegrityTest } from '../storage/sto
 import type { StorageProviderId } from '../storage/storageProvider.ts';
 import {
   computeAndroidBridgeDiagnostics,
+  issueAndroidAttestationChallenge,
   recordNativeAndroidAttestation,
   revokeAndroidSafAuthorization,
 } from '../storage/androidBridgeDiagnostic.ts';
@@ -27,13 +28,18 @@ import {
   getDeviceManagerSnapshot,
 } from '../services/deviceManagerService.ts';
 import {
+  checkAuthRateLimit,
+  clearAuthFailures,
   getSecuritySnapshot,
   isAuthorizedForAction,
   loginOwnerSession,
+  recordAuthFailure,
   revokeOwnerSession,
+  sanitizeConfigForClient,
   setupOwnerPasskey,
   updateSecurityPermissions,
   type SecurityPermissions,
+  type SessionRole,
 } from '../services/securityService.ts';
 import {
   getIsolatedDemoCatalog,
@@ -69,7 +75,9 @@ import {
   registerWorker,
   restoreTrainingCheckpoint,
   saveTrainingCheckpoint,
+  transferResourceToWorker,
   updateTrainingJobControl,
+  verifyWorkerTelemetryAuth,
   type ModelScaleTier,
   type TrainingJobRecord,
 } from '../services/mindFactoryService.ts';
@@ -79,6 +87,7 @@ import {
   getRealtimeSyncService,
 } from '../services/realtimeSyncService.ts';
 import {
+  executeModelRepair,
   listModelProducts,
   receiveExternalModelForRepair,
   registerOrRepairProduct,
@@ -92,10 +101,52 @@ import {
   listDeliveryPackages,
   verifyDeliveryPackageIntegrity,
 } from '../services/ngIpService.ts';
+import { resolveSafeRealPath } from '../utils/fsAtomic.ts';
+import { validateWorkerEndpointUrl } from '../utils/urlSecurity.ts';
+
+function readBearerToken(req: express.Request): string | undefined {
+  const authHeader = req.header('authorization');
+  if (typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) return token;
+  }
+  return undefined;
+}
 
 function readOwnerToken(req: express.Request): string | undefined {
-  const token = req.header('x-ng-owner-token');
-  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+  const headerToken = req.header('x-ng-owner-token');
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  return readBearerToken(req);
+}
+
+function isLoopbackRemoteAddress(remoteAddress: string | undefined): boolean {
+  if (!remoteAddress) return false;
+  return (
+    remoteAddress === '127.0.0.1' ||
+    remoteAddress === '::1' ||
+    remoteAddress === '::ffff:127.0.0.1'
+  );
+}
+
+type AuthActionScope = 'export' | 'delete' | 'pairing' | 'mutate' | 'admin';
+
+function requireOwnerAuth(actionType: AuthActionScope): express.RequestHandler {
+  return (req, res, next) => {
+    const db = getDatabase();
+    const rawToken = readOwnerToken(req);
+    const auth = isAuthorizedForAction(db, actionType, rawToken);
+    if (!auth.allowed) {
+      const config = getConfigMap(db);
+      const lockConfigured = Boolean(config.owner_passkey_hash);
+      // 401 when lock is configured and token is missing/expired/invalid; 403 for pre-lock block or RBAC denial
+      const isRoleOrPrelock = !lockConfigured || Boolean(auth.role);
+      res.status(isRoleOrPrelock ? 403 : 401).json({ error: auth.reason });
+      return;
+    }
+    next();
+  };
 }
 
 export function createApiRouter() {
@@ -147,7 +198,7 @@ export function createApiRouter() {
     });
   });
 
-  router.post('/sync/refresh', async (_req, res) => {
+  router.post('/sync/refresh', requireOwnerAuth('mutate'), async (_req, res) => {
     try {
       const db = getDatabase();
       const result = await getRealtimeSyncService().syncAndBroadcast(db, 'manual-sync');
@@ -161,12 +212,13 @@ export function createApiRouter() {
 
   router.get('/config', (_req, res) => {
     const db = getDatabase();
-    const config = getConfigMap(db);
-    const environment = probeDeviceEnvironment(config);
+    const rawConfig = getConfigMap(db);
+    const config = sanitizeConfigForClient(rawConfig);
+    const environment = probeDeviceEnvironment(rawConfig);
     res.json({ config, environment });
   });
 
-  router.put('/config', (req, res) => {
+  router.put('/config', requireOwnerAuth('admin'), (req, res) => {
     const db = getDatabase();
     const updates = req.body as Record<string, unknown>;
     if (!updates || typeof updates !== 'object') {
@@ -174,12 +226,13 @@ export function createApiRouter() {
       return;
     }
 
-    if (typeof updates.bridge_endpoint === 'string') {
-      const auth = isAuthorizedForAction(db, 'pairing', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
+    if (typeof updates.bridge_endpoint === 'string' && updates.bridge_endpoint.trim()) {
+      const urlCheck = validateWorkerEndpointUrl(updates.bridge_endpoint.trim());
+      if (!urlCheck.ok) {
+        res.status(400).json({ error: urlCheck.reason || 'Blocked unsafe bridge_endpoint URL' });
         return;
       }
+      updates.bridge_endpoint = urlCheck.normalizedUrl;
     }
 
     const allowedKeys = new Set([
@@ -227,12 +280,13 @@ export function createApiRouter() {
       details: applied,
     });
 
-    const config = getConfigMap(db);
-    const environment = probeDeviceEnvironment(config);
+    const rawConfig = getConfigMap(db);
+    const config = sanitizeConfigForClient(rawConfig);
+    const environment = probeDeviceEnvironment(rawConfig);
     res.json({ config, environment, auditEntry });
   });
 
-  router.post('/system/verify-storage', (req, res) => {
+  router.post('/system/verify-storage', requireOwnerAuth('mutate'), (req, res) => {
     const db = getDatabase();
     const config = getConfigMap(db);
     const body = (req.body ?? {}) as { providerId?: StorageProviderId };
@@ -295,7 +349,7 @@ export function createApiRouter() {
     });
   });
 
-  router.post('/storage/approve-location', (req, res) => {
+  router.post('/storage/approve-location', requireOwnerAuth('admin'), (req, res) => {
     const db = getDatabase();
     const body = (req.body ?? {}) as {
       providerId?: StorageProviderId;
@@ -332,7 +386,7 @@ export function createApiRouter() {
     }
 
     const updatedConfig = getConfigMap(db);
-    let envBefore = probeDeviceEnvironment(updatedConfig);
+    const envBefore = probeDeviceEnvironment(updatedConfig);
     const activeProbe =
       providerId === 'host_dev'
         ? envBefore.hostEnvironment.provider
@@ -410,7 +464,7 @@ export function createApiRouter() {
     res.json({ projects, independentResources });
   });
 
-  router.post('/projects', (req, res) => {
+  router.post('/projects', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = req.body as {
@@ -450,7 +504,7 @@ export function createApiRouter() {
     res.json({ project, independentResources });
   });
 
-  router.put('/projects/:id', (req, res) => {
+  router.put('/projects/:id', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = req.body as {
@@ -475,7 +529,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/projects/:id/resources', (req, res) => {
+  router.post('/projects/:id/resources', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = req.body as { resourceId?: string; role?: string };
@@ -492,7 +546,7 @@ export function createApiRouter() {
     }
   });
 
-  router.delete('/projects/:id/resources/:resourceId', (req, res) => {
+  router.delete('/projects/:id/resources/:resourceId', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const project = unlinkResourceFromProject(db, req.params.id, req.params.resourceId);
@@ -504,14 +558,9 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/projects/:id/export', (req, res) => {
+  router.post('/projects/:id/export', requireOwnerAuth('export'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const report = exportProjectReport(db, req.params.id);
       res.json({ report });
     } catch (err) {
@@ -521,7 +570,7 @@ export function createApiRouter() {
     }
   });
 
-  // --- Android Bridge Diagnostics & SAF Attestation Endpoints ---
+  // --- Android Bridge Diagnostics & Cryptographic Challenge Attestation Endpoints ---
   router.get('/android/bridge-status', (_req, res) => {
     const db = getDatabase();
     const config = getConfigMap(db);
@@ -529,10 +578,18 @@ export function createApiRouter() {
     res.json({ diagnostics });
   });
 
-  router.post('/android/attest', (req, res) => {
+  router.post('/android/challenge', requireOwnerAuth('admin'), (_req, res) => {
+    const db = getDatabase();
+    const challenge = issueAndroidAttestationChallenge(db);
+    res.json(challenge);
+  });
+
+  router.post('/android/attest', requireOwnerAuth('admin'), (req, res) => {
     try {
       const db = getDatabase();
-      const diagnostics = recordNativeAndroidAttestation(db, req.body ?? {});
+      const diagnostics = recordNativeAndroidAttestation(db, req.body ?? {}, {
+        requireChallenge: true,
+      });
       res.json({ diagnostics });
     } catch (err) {
       res.status(400).json({
@@ -541,7 +598,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/android/revoke', (_req, res) => {
+  router.post('/android/revoke', requireOwnerAuth('admin'), (_req, res) => {
     const db = getDatabase();
     const diagnostics = revokeAndroidSafAuthorization(db);
     res.json({ diagnostics });
@@ -554,14 +611,9 @@ export function createApiRouter() {
     res.json(snapshot);
   });
 
-  router.post('/device/cleanup', (req, res) => {
+  router.post('/device/cleanup', requireOwnerAuth('delete'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'delete', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const body = (req.body ?? {}) as { filePath?: string; ownerApproved?: boolean };
       if (!body.filePath) {
         res.status(400).json({ error: 'filePath is required' });
@@ -586,39 +638,77 @@ export function createApiRouter() {
   });
 
   router.post('/security/setup-owner', (req, res) => {
+    const clientKey = req.socket.remoteAddress || req.ip || 'local';
+    const rate = checkAuthRateLimit(clientKey);
+    if (!rate.allowed) {
+      res.setHeader('Retry-After', String(rate.retryAfterSeconds));
+      res.status(429).json({
+        error: `Too many authentication attempts. Retry after ${rate.retryAfterSeconds}s.`,
+      });
+      return;
+    }
+
     try {
       const db = getDatabase();
-      const body = (req.body ?? {}) as { passkey?: string; deviceLabel?: string };
+      const body = (req.body ?? {}) as {
+        passkey?: string;
+        deviceLabel?: string;
+        bootstrapToken?: string;
+      };
+      const isRemoteHttpRequest = !isLoopbackRemoteAddress(req.socket.remoteAddress);
       const result = setupOwnerPasskey(db, {
         passkey: body.passkey ?? '',
         deviceLabel: body.deviceLabel,
         currentToken: readOwnerToken(req),
+        bootstrapToken: body.bootstrapToken,
+        isRemoteHttpRequest,
       });
+      clearAuthFailures(clientKey);
       res.status(201).json(result);
     } catch (err) {
-      res.status(400).json({
-        error: err instanceof Error ? err.message : 'Failed to configure owner passkey',
-      });
+      recordAuthFailure(clientKey);
+      const msg = err instanceof Error ? err.message : 'Failed to configure owner passkey';
+      const status = msg.startsWith('Blocked:') || msg.includes('already initialized') || msg.includes('Active OWNER')
+        ? 403
+        : 400;
+      res.status(status).json({ error: msg });
     }
   });
 
   router.post('/security/login', (req, res) => {
+    const clientKey = req.socket.remoteAddress || req.ip || 'local';
+    const rate = checkAuthRateLimit(clientKey);
+    if (!rate.allowed) {
+      res.setHeader('Retry-After', String(rate.retryAfterSeconds));
+      res.status(429).json({
+        error: `Too many failed login attempts. Retry after ${rate.retryAfterSeconds}s.`,
+      });
+      return;
+    }
+
     try {
       const db = getDatabase();
-      const body = (req.body ?? {}) as { passkey?: string; deviceLabel?: string };
+      const body = (req.body ?? {}) as {
+        passkey?: string;
+        deviceLabel?: string;
+        role?: SessionRole;
+      };
       const result = loginOwnerSession(db, {
         passkey: body.passkey ?? '',
         deviceLabel: body.deviceLabel,
+        role: body.role,
       });
+      clearAuthFailures(clientKey);
       res.json(result);
     } catch (err) {
+      recordAuthFailure(clientKey);
       res.status(401).json({
         error: err instanceof Error ? err.message : 'Owner authentication failed',
       });
     }
   });
 
-  router.post('/security/sessions/:id/revoke', (req, res) => {
+  router.post('/security/sessions/:id/revoke', requireOwnerAuth('admin'), (req, res) => {
     try {
       const db = getDatabase();
       const snapshot = revokeOwnerSession(db, req.params.id, readOwnerToken(req));
@@ -630,7 +720,7 @@ export function createApiRouter() {
     }
   });
 
-  router.put('/security/permissions', (req, res) => {
+  router.put('/security/permissions', requireOwnerAuth('admin'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as Partial<SecurityPermissions>;
@@ -656,7 +746,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/demo/infer', async (req, res) => {
+  router.post('/demo/infer', requireOwnerAuth('mutate'), async (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as { productId?: string; prompt?: string };
@@ -676,7 +766,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/demo/reset', (_req, res) => {
+  router.post('/demo/reset', requireOwnerAuth('mutate'), (_req, res) => {
     const db = getDatabase();
     const result = resetDemoSession(db);
     res.json(result);
@@ -697,7 +787,7 @@ export function createApiRouter() {
     res.json(getResourceLibraryIntegrityStatus(db));
   });
 
-  router.post('/wings/data/resources/check-integrity', (_req, res) => {
+  router.post('/wings/data/resources/check-integrity', requireOwnerAuth('mutate'), (_req, res) => {
     try {
       const db = getDatabase();
       const result = startBackgroundResourceIntegrityCheck(db, () => {
@@ -711,7 +801,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/resources', (req, res) => {
+  router.post('/wings/data/resources', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -749,7 +839,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/dataset-package', (req, res) => {
+  router.post('/wings/data/dataset-package', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -783,7 +873,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/resources/:id/verify', (req, res) => {
+  router.post('/wings/data/resources/:id/verify', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const resource = verifyResourceIntegrity(db, req.params.id);
@@ -794,14 +884,9 @@ export function createApiRouter() {
     }
   });
 
-  router.delete('/wings/data/resources/:id', (req, res) => {
+  router.delete('/wings/data/resources/:id', requireOwnerAuth('delete'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'delete', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const result = deleteResourceSafely(db, req.params.id);
       void getRealtimeSyncService().broadcastSnapshot(db, 'resource-deleted');
       res.json(result);
@@ -811,7 +896,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/archive', (req, res) => {
+  router.post('/wings/data/archive', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -829,7 +914,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/archive/verify', (_req, res) => {
+  router.post('/wings/data/archive/verify', requireOwnerAuth('mutate'), (_req, res) => {
     try {
       const db = getDatabase();
       const summary = verifyArchiveIntegrityBatch(db);
@@ -840,14 +925,9 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/data/manifest', (req, res) => {
+  router.post('/wings/data/manifest', requireOwnerAuth('export'), (_req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const manifest = generateDataFactoryManifest(db);
       void getRealtimeSyncService().broadcastSnapshot(db, 'data-manifest-generated');
       res.json({ manifest });
@@ -866,14 +946,9 @@ export function createApiRouter() {
     });
   });
 
-  router.post('/wings/mind/workers', (req, res) => {
+  router.post('/wings/mind/workers', requireOwnerAuth('pairing'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'pairing', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const body = (req.body ?? {}) as {
         workerName?: string;
         endpointUrl?: string;
@@ -899,7 +974,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/workers/:id/probe', async (req, res) => {
+  router.post('/wings/mind/workers/:id/probe', requireOwnerAuth('pairing'), async (req, res) => {
     try {
       const db = getDatabase();
       const result = await probeWorkerConnection(db, req.params.id);
@@ -910,14 +985,9 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/transfer-manifest', (req, res) => {
+  router.post('/wings/mind/transfer-manifest', requireOwnerAuth('export'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const body = (req.body ?? {}) as {
         resourceId?: string;
         workerId?: string;
@@ -935,7 +1005,27 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/create', (req, res) => {
+  router.post('/wings/mind/transfer', requireOwnerAuth('export'), async (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        resourceId?: string;
+        workerId?: string;
+        chunkSizeBytes?: number;
+      };
+      const result = await transferResourceToWorker(db, {
+        resourceId: body.resourceId ?? '',
+        workerId: body.workerId ?? '',
+        chunkSizeBytes: body.chunkSizeBytes,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'worker-chunk-transfer-completed');
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Worker chunk transfer failed' });
+    }
+  });
+
+  router.post('/wings/mind/create', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -967,7 +1057,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/intake', (req, res) => {
+  router.post('/wings/mind/intake', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -978,6 +1068,8 @@ export function createApiRouter() {
         scaleTier?: ModelScaleTier;
         license?: string;
         weightsPath?: string;
+        fileBase64?: string;
+        fileName?: string;
         tokenizerSpec?: string;
         originSource?: string;
       };
@@ -989,6 +1081,8 @@ export function createApiRouter() {
         scaleTier: body.scaleTier ?? '1B',
         license: body.license ?? '',
         weightsPath: body.weightsPath,
+        fileBase64: body.fileBase64,
+        fileName: body.fileName,
         tokenizerSpec: body.tokenizerSpec,
         originSource: body.originSource ?? 'EXTERNAL_INTAKE',
       });
@@ -999,7 +1093,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/jobs', async (req, res) => {
+  router.post('/wings/mind/jobs', requireOwnerAuth('mutate'), async (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -1030,15 +1124,17 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/jobs/:id/control', (req, res) => {
+  router.post('/wings/mind/jobs/:id/control', requireOwnerAuth('mutate'), async (req, res) => {
     try {
       const db = getDatabase();
-      const body = (req.body ?? {}) as { action?: string };
+      const body = (req.body ?? {}) as { action?: string; requireWorkerAck?: boolean };
       if (body.action !== 'PAUSE' && body.action !== 'RESUME' && body.action !== 'CANCEL') {
         res.status(400).json({ error: 'action must be PAUSE, RESUME, or CANCEL' });
         return;
       }
-      const job = updateTrainingJobControl(db, req.params.id, body.action);
+      const job = await updateTrainingJobControl(db, req.params.id, body.action, {
+        requireWorkerAck: Boolean(body.requireWorkerAck),
+      });
       void getRealtimeSyncService().broadcastSnapshot(db, 'training-job-controlled');
       res.json({ job });
     } catch (err) {
@@ -1049,6 +1145,40 @@ export function createApiRouter() {
   router.post('/wings/mind/jobs/:id/telemetry', (req, res) => {
     try {
       const db = getDatabase();
+      const targetJob = listTrainingJobs(db).find((j) => j.id === req.params.id);
+      if (!targetJob) {
+        res.status(404).json({ error: `Training job not found: ${req.params.id}` });
+        return;
+      }
+
+      const rawBodyText =
+        (req as express.Request & { rawBody?: string }).rawBody ?? JSON.stringify(req.body ?? {});
+
+      const workerAuth = verifyWorkerTelemetryAuth(
+        db,
+        targetJob.workerId,
+        {
+          workerIdHeader: req.header('x-ng-worker-id'),
+          timestampHeader: req.header('x-ng-worker-timestamp'),
+          signatureHeader: req.header('x-ng-worker-signature'),
+          authTokenHeader: req.header('x-ng-worker-secret') || readBearerToken(req),
+        },
+        rawBodyText,
+      );
+
+      if (!workerAuth.valid) {
+        recordAuditEvent(db, {
+          actor: 'UNAUTHENTICATED_WORKER',
+          category: 'SECURITY',
+          action: 'REJECT_FORGED_JOB_TELEMETRY',
+          target: req.params.id,
+          outcome: 'BLOCKED',
+          details: { workerId: targetJob.workerId, reason: workerAuth.reason },
+        });
+        res.status(401).json({ error: workerAuth.reason || 'Worker telemetry authentication failed' });
+        return;
+      }
+
       const body = (req.body ?? {}) as {
         currentStep?: number;
         totalSteps?: number;
@@ -1065,7 +1195,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/jobs/:id/checkpoint', (req, res) => {
+  router.post('/wings/mind/jobs/:id/checkpoint', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -1090,7 +1220,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/mind/jobs/:id/restore', (req, res) => {
+  router.post('/wings/mind/jobs/:id/restore', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as { checkpointPath?: string };
@@ -1118,7 +1248,7 @@ export function createApiRouter() {
     res.json({ products: listModelProducts(db) });
   });
 
-  router.post('/wings/repair/intake', (req, res) => {
+  router.post('/wings/repair/intake', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -1128,6 +1258,7 @@ export function createApiRouter() {
         license?: string;
         architectureSummary?: string;
         weightsPath?: string;
+        tokenizerPath?: string;
         fileName?: string;
         fileBase64?: string;
         contentText?: string;
@@ -1139,6 +1270,7 @@ export function createApiRouter() {
         license: body.license ?? '',
         architectureSummary: body.architectureSummary ?? '',
         weightsPath: body.weightsPath,
+        tokenizerPath: body.tokenizerPath,
         fileName: body.fileName,
         fileBase64: body.fileBase64,
         contentText: body.contentText,
@@ -1150,7 +1282,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/repair/products', (req, res) => {
+  router.post('/wings/repair/products', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as {
@@ -1165,6 +1297,9 @@ export function createApiRouter() {
         license?: string;
         safetyNotes?: string;
         restoreCheckpointPath?: string;
+        weightsPath?: string;
+        tokenizerPath?: string;
+        configPath?: string;
         changelog?: string;
       };
       const product = registerOrRepairProduct(db, {
@@ -1179,6 +1314,9 @@ export function createApiRouter() {
         license: body.license ?? '',
         safetyNotes: body.safetyNotes,
         restoreCheckpointPath: body.restoreCheckpointPath,
+        weightsPath: body.weightsPath,
+        tokenizerPath: body.tokenizerPath,
+        configPath: body.configPath,
         changelog: body.changelog,
       });
       void getRealtimeSyncService().broadcastSnapshot(db, 'repair-product-saved');
@@ -1188,7 +1326,38 @@ export function createApiRouter() {
     }
   });
 
-  router.put('/wings/repair/products/:id/state', (req, res) => {
+  router.post('/wings/repair/products/:id/execute', requireOwnerAuth('mutate'), (req, res) => {
+    try {
+      const db = getDatabase();
+      const body = (req.body ?? {}) as {
+        operation?: 'SANITIZE_NAN_INF' | 'INT8_QUANTIZE';
+        newVersion?: string;
+        productClass?: NgProductClass;
+        license?: string;
+        safetyNotes?: string;
+        changelog?: string;
+      };
+      if (body.operation !== 'SANITIZE_NAN_INF' && body.operation !== 'INT8_QUANTIZE') {
+        res.status(400).json({ error: 'operation must be SANITIZE_NAN_INF or INT8_QUANTIZE' });
+        return;
+      }
+      const repaired = executeModelRepair(db, {
+        productId: req.params.id,
+        operation: body.operation,
+        newVersion: body.newVersion ?? '',
+        productClass: body.productClass,
+        license: body.license,
+        safetyNotes: body.safetyNotes,
+        changelog: body.changelog,
+      });
+      void getRealtimeSyncService().broadcastSnapshot(db, 'repair-binary-weights-executed');
+      res.json(repaired);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Binary weights repair failed' });
+    }
+  });
+
+  router.put('/wings/repair/products/:id/state', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const body = (req.body ?? {}) as { nextState?: ModelLifecycleState };
@@ -1212,7 +1381,7 @@ export function createApiRouter() {
     res.json({ reports: listQcReports(db, productId) });
   });
 
-  router.post('/wings/trust/qc/:productId/run', (req, res) => {
+  router.post('/wings/trust/qc/:productId/run', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const summary = runTenSuiteQcCheck(db, req.params.productId);
@@ -1229,14 +1398,9 @@ export function createApiRouter() {
     res.json({ packages: listDeliveryPackages(db) });
   });
 
-  router.post('/wings/ngip/packages/:productId/build', (req, res) => {
+  router.post('/wings/ngip/packages/:productId/build', requireOwnerAuth('export'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
       const body = (req.body ?? {}) as { ipHolder?: string; licenseTermsNote?: string };
       const deliveryPackage = buildCertifiedDeliveryPackage(db, req.params.productId, {
         ipHolder: body.ipHolder,
@@ -1250,7 +1414,7 @@ export function createApiRouter() {
     }
   });
 
-  router.post('/wings/ngip/packages/:id/verify', (req, res) => {
+  router.post('/wings/ngip/packages/:id/verify', requireOwnerAuth('mutate'), (req, res) => {
     try {
       const db = getDatabase();
       const result = verifyDeliveryPackageIntegrity(db, req.params.id);
@@ -1261,15 +1425,9 @@ export function createApiRouter() {
     }
   });
 
-  router.get('/wings/ngip/packages/:id/download', (req, res) => {
+  router.get('/wings/ngip/packages/:id/download', requireOwnerAuth('export'), (req, res) => {
     try {
       const db = getDatabase();
-      const auth = isAuthorizedForAction(db, 'export', readOwnerToken(req));
-      if (!auth.allowed) {
-        res.status(403).json({ error: auth.reason });
-        return;
-      }
-
       const pkg = listDeliveryPackages(db).find((p) => p.id === req.params.id);
       if (!pkg) {
         res.status(404).json({ error: 'Delivery package not found' });
@@ -1278,11 +1436,12 @@ export function createApiRouter() {
 
       const config = getConfigMap(db);
       const dataDir = path.resolve(config.data_dir || process.cwd());
-      const resolvedZip = path.resolve(pkg.zipPath);
-      if (!resolvedZip.startsWith(`${dataDir}${path.sep}`)) {
+      const safeCheck = resolveSafeRealPath(pkg.zipPath, dataDir);
+      if (!safeCheck.allowed) {
         res.status(403).json({ error: 'Blocked: Delivery package path outside workspace' });
         return;
       }
+      const resolvedZip = safeCheck.canonicalTarget;
       if (!fs.existsSync(resolvedZip) || !fs.statSync(resolvedZip).isFile()) {
         res.status(404).json({ error: 'Certified delivery ZIP missing on disk' });
         return;

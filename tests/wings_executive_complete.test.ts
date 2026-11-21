@@ -39,6 +39,8 @@ import { createProject, linkResourceToProject, unlinkResourceFromProject } from 
 import { runProviderIntegrityTest } from '../server/storage/storageProbe.ts';
 import { getMasterDashboardSnapshot } from '../server/services/dashboardService.ts';
 import { listAuditLogs } from '../server/audit/auditService.ts';
+import { buildNgwtBinaryBuffer } from '../server/ml/neuralMindEngine.ts';
+import { saveTokenizerFile, trainTokenizerFromCorpus } from '../server/ml/tokenizerEngine.ts';
 
 function setupIsolatedDb() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-ilmf-exec-'));
@@ -343,21 +345,23 @@ test('6. NEW MIND: create independent Mind, save/log/restore training checkpoint
     // Restore back to step 100
     const restored = restoreTrainingCheckpoint(db, job.id, cp1.checkpointPath);
     assert.equal(restored.restoredStep, 100);
+    assert.equal(restored.adamRestored, true);
+    assert.ok(restored.weightsFloatCount > 0);
     assert.equal(restored.job.jobStatus, 'PAUSED');
 
-    // Resume from PAUSED -> RUNNING (since job was RUNNING when checkpoint was saved), then PAUSE -> CANCEL -> block further control
-    const resumed = updateTrainingJobControl(db, job.id, 'RESUME');
+    // Resume from PAUSED -> RUNNING, then PAUSE -> CANCEL -> block further control
+    const resumed = await updateTrainingJobControl(db, job.id, 'RESUME');
     assert.equal(resumed.jobStatus, 'RUNNING');
-    const pausedAgain = updateTrainingJobControl(db, job.id, 'PAUSE');
+    const pausedAgain = await updateTrainingJobControl(db, job.id, 'PAUSE');
     assert.equal(pausedAgain.jobStatus, 'PAUSED');
-    const cancelled = updateTrainingJobControl(db, job.id, 'CANCEL');
+    const cancelled = await updateTrainingJobControl(db, job.id, 'CANCEL');
     assert.equal(cancelled.jobStatus, 'CANCELLED');
-    assert.throws(() => updateTrainingJobControl(db, job.id, 'RESUME'), /Cannot RESUME a job in status CANCELLED/);
+    await assert.rejects(() => updateTrainingJobControl(db, job.id, 'RESUME'), /Cannot RESUME a job in status CANCELLED/);
 
-    // Tamper cp2 checkpoint file on disk -> restore MUST reject!
-    const rawCp2 = JSON.parse(fs.readFileSync(cp2.checkpointPath, 'utf-8')) as Record<string, unknown>;
-    rawCp2.trainingLoss = 0.0001;
-    fs.writeFileSync(cp2.checkpointPath, JSON.stringify(rawCp2, null, 2), 'utf-8');
+    // Tamper cp2 binary NGCK checkpoint file on disk -> restore MUST reject!
+    const cp2Buf = fs.readFileSync(cp2.checkpointPath);
+    cp2Buf[cp2Buf.length - 1] = cp2Buf[cp2Buf.length - 1] ^ 0xff;
+    fs.writeFileSync(cp2.checkpointPath, cp2Buf);
     assert.throws(() => restoreTrainingCheckpoint(db, job.id, cp2.checkpointPath), /SHA-256 mismatch/);
   } finally {
     db.close();
@@ -368,37 +372,68 @@ test('6. NEW MIND: create independent Mind, save/log/restore training checkpoint
 test('7-9. MIND REPAIR (immutable original), TRUST & QC (evidence dossier), NG-IP (license gate + ZIP verify) & ARCHIVE batch verify', async () => {
   const { db, dir } = setupIsolatedDb();
   try {
-    // Prepare original external model artifact
-    const originalPayload = Buffer.from(
-      JSON.stringify({ model: 'External-GPT-Legacy', layers: 24, format: 'safetensors-header' }),
-      'utf-8',
-    );
+    // Prepare real binary NGWT external model + BPE tokenizer artifact inside workspace
+    const tokModel = trainTokenizerFromCorpus(['External GPT Legacy Arabic Repair Corpus', 'NG-ILMF verification'], {
+      spec: 'NG-BPE-V1',
+      targetMerges: 16,
+    });
+    const tokPath = path.join(dir, 'legacy_x_tokenizer.json');
+    saveTokenizerFile(tokPath, tokModel);
+
+    const origBuilt = buildNgwtBinaryBuffer({
+      mindId: 'LEGACY-X',
+      name: 'Legacy-Model-X',
+      version: '1.0.0',
+      architecture: 'Transformer 24L',
+      scaleTier: '3B',
+      vocabSize: tokModel.vocabSize,
+      numLayers: 2,
+      hiddenDim: 16,
+    });
     const intake = receiveExternalModelForRepair(db, {
       name: 'Legacy-Model-X',
       version: '1.0.0',
       originSource: 'CLIENT_HANDOFF',
       license: 'Apache-2.0',
       architectureSummary: 'Transformer 24L requiring tokenizer repair',
-      fileName: 'legacy_x.json',
-      fileBase64: originalPayload.toString('base64'),
+      fileName: 'legacy_x.ngbin',
+      fileBase64: origBuilt.buffer.toString('base64'),
+      tokenizerPath: tokPath,
     });
     assert.ok(fs.existsSync(intake.originalBackupPath));
     assert.equal(intake.inspectionReport.sha256Valid, true);
+    assert.equal(intake.inspectionReport.hasBinaryWeights, true);
     const originalFileDigest = intake.originalSha256;
 
-    // Repair product -> produces new weightsSha256 & version, while keeping ORIGINAL file intact on disk
-    const repairedWeightsSha = crypto.createHash('sha256').update('repaired-weights-v2').digest('hex');
+    // Repair product -> writes repaired binary weights inside workspace while keeping ORIGINAL file intact on disk
+    const repairedWeightsBuilt = buildNgwtBinaryBuffer({
+      mindId: intake.product.id,
+      name: 'Legacy-Model-X-Repaired',
+      version: '2.0.0',
+      architecture: 'Transformer 24L with repaired UTF-8 tokenizer & RoPE fix',
+      scaleTier: '3B',
+      vocabSize: tokModel.vocabSize,
+      numLayers: 2,
+      hiddenDim: 16,
+      seed: 'repaired-v2',
+    });
+    const repairedWeightsPath = path.join(dir, 'repaired_legacy_x_v2.ngbin');
+    fs.writeFileSync(repairedWeightsPath, repairedWeightsBuilt.buffer);
+
     const repaired = registerOrRepairProduct(db, {
       id: intake.product.id,
       name: 'Legacy-Model-X-Repaired',
       productClass: 'NG-REPAIRED',
       version: '2.0.0',
-      weightsSha256: repairedWeightsSha,
+      weightsSha256: repairedWeightsBuilt.sha256,
       architectureSummary: 'Transformer 24L with repaired UTF-8 tokenizer & RoPE fix',
       trainingSummary: 'Post-repair alignment & calibration',
       evaluationSummary: 'All regression prompts verified',
       license: 'Apache-2.0',
       safetyNotes: 'Verified safe and toxicity filtered',
+      weightsPath: repairedWeightsPath,
+      tokenizerPath: tokPath,
+      restoreCheckpointPath: intake.originalBackupPath,
       changelog: 'Fixed tokenizer EOS handling',
     });
 
@@ -432,6 +467,8 @@ test('7-9. MIND REPAIR (immutable original), TRUST & QC (evidence dossier), NG-I
     assert.equal(verifyOk.fileExists, true);
     assert.equal(verifyOk.validPkzipHeader, true);
     assert.equal(verifyOk.sha256Matched, true);
+    assert.equal(verifyOk.allEntriesVerified, true);
+    assert.equal(verifyOk.containsBinaryWeights, true);
 
     // Tamper ZIP -> integrity verify detects mismatch!
     const zipBytes = fs.readFileSync(pkg.zipPath);

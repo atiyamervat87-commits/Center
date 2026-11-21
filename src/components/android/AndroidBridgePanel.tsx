@@ -15,10 +15,12 @@ import {
   launchAndroidDocumentTreePicker,
   revokeNativeSafUri,
   runNativeSafSha256ProbeAsync,
+  signNativeAttestationChallenge,
   verifyNativeSafUri,
   type SafSha256ProbeResult,
 } from '../../bridge/androidBridge';
 import {
+  requestAndroidBridgeChallenge,
   revokeAndroidSafPermission,
   submitAndroidBridgeAttestation,
 } from '../../services/apiClient';
@@ -43,6 +45,39 @@ export function AndroidBridgePanel({
     text: string;
   } | null>(null);
   const [safProbe, setSafProbe] = useState<SafSha256ProbeResult | null>(null);
+
+  const submitSignedAttestation = async (
+    nativeDiag: NonNullable<ReturnType<typeof getNativeAndroidDiagnostics>>,
+    safUri: string,
+    permCheck: { readable?: boolean; writable?: boolean; revoked?: boolean; authorized?: boolean },
+    probeResult: SafSha256ProbeResult | null,
+  ) => {
+    const ch = await requestAndroidBridgeChallenge();
+    const signed = signNativeAttestationChallenge(
+      ch.challenge,
+      safUri,
+      probeResult?.expectedSha256,
+    );
+    if (!signed?.proofSignature) {
+      throw new Error('Native Android APK bridge failed to sign server attestation challenge.');
+    }
+    await submitAndroidBridgeAttestation({
+      isNativeAndroid: nativeDiag.isNativeAndroid,
+      manufacturer: nativeDiag.manufacturer,
+      model: nativeDiag.model,
+      androidRelease: nativeDiag.androidRelease,
+      sdkInt: nativeDiag.sdkInt,
+      termuxPackageInstalled: nativeDiag.termuxPackageInstalled,
+      safUri,
+      persistedRead: Boolean(permCheck.readable),
+      persistedWrite: Boolean(permCheck.writable),
+      revoked: Boolean(permCheck.revoked || !permCheck.authorized),
+      safProbeReport: probeResult,
+      challengeId: ch.challengeId,
+      challenge: ch.challenge,
+      proofSignature: signed.proofSignature,
+    });
+  };
 
   const handlePickArchiveFolder = async () => {
     setBusy(true);
@@ -69,19 +104,7 @@ export function AndroidBridgePanel({
       const probeResult = await runNativeSafSha256ProbeAsync(pickerResult.uri);
       setSafProbe(probeResult);
 
-      await submitAndroidBridgeAttestation({
-        isNativeAndroid: nativeDiag.isNativeAndroid,
-        manufacturer: nativeDiag.manufacturer,
-        model: nativeDiag.model,
-        androidRelease: nativeDiag.androidRelease,
-        sdkInt: nativeDiag.sdkInt,
-        termuxPackageInstalled: nativeDiag.termuxPackageInstalled,
-        safUri: pickerResult.uri,
-        persistedRead: Boolean(pickerResult.readable),
-        persistedWrite: Boolean(pickerResult.writable),
-        revoked: Boolean(pickerResult.revoked),
-        safProbeReport: probeResult,
-      });
+      await submitSignedAttestation(nativeDiag, pickerResult.uri, pickerResult, probeResult);
 
       await onUpdated();
       setStatusMessage({
@@ -128,19 +151,7 @@ export function AndroidBridgePanel({
         : null;
       if (probeResult) setSafProbe(probeResult);
 
-      await submitAndroidBridgeAttestation({
-        isNativeAndroid: nativeDiag.isNativeAndroid,
-        manufacturer: nativeDiag.manufacturer,
-        model: nativeDiag.model,
-        androidRelease: nativeDiag.androidRelease,
-        sdkInt: nativeDiag.sdkInt,
-        termuxPackageInstalled: nativeDiag.termuxPackageInstalled,
-        safUri: targetUri,
-        persistedRead: Boolean(permCheck.readable),
-        persistedWrite: Boolean(permCheck.writable),
-        revoked: Boolean(permCheck.revoked || !permCheck.authorized),
-        safProbeReport: probeResult,
-      });
+      await submitSignedAttestation(nativeDiag, targetUri, permCheck, probeResult);
 
       await onUpdated();
     } catch (err) {

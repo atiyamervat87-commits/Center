@@ -5,6 +5,14 @@ import type { DatabaseSync } from 'node:sqlite';
 import { getConfigMap } from '../db/database.ts';
 import { recordAuditEvent } from '../audit/auditService.ts';
 import { probeDeviceEnvironment } from '../storage/storageProbe.ts';
+import { normalizeArchiveRootPath } from '../storage/storageProvider.ts';
+import { writeFileAtomic } from '../utils/fsAtomic.ts';
+import { extractAndVerifyZipArchive } from '../utils/zipBuilder.ts';
+import {
+  loadTokenizerFile,
+  tokenizeDatasetLines,
+  trainTokenizerFromCorpus,
+} from '../ml/tokenizerEngine.ts';
 
 export type LibrarySection = 'MODEL' | 'DATASET' | 'SOFTWARE' | 'KNOWLEDGE';
 export type VerificationStatus = 'VERIFIED' | 'UNVERIFIED' | 'FAILED' | 'QUARANTINED';
@@ -494,7 +502,7 @@ function getVerifiedArchiveRoot(db: DatabaseSync): string {
     );
   }
 
-  return path.join(selectedProbe.configuredPath, 'NG-ILMF_ARCHIVE');
+  return normalizeArchiveRootPath(selectedProbe.configuredPath);
 }
 
 export function archiveResourceToSmartArchive(
@@ -519,7 +527,7 @@ export function archiveResourceToSmartArchive(
   const folderPath = path.join(archiveRoot, input.categoryFolder);
   fs.mkdirSync(folderPath, { recursive: true });
   const destPath = path.join(folderPath, `${resource.id}_${path.basename(resource.filePath)}`);
-  fs.copyFileSync(resource.filePath, destPath);
+  writeFileAtomic(destPath, fs.readFileSync(resource.filePath));
 
   const destProbe = computeFileSha256(destPath);
   if (!destProbe.exists || destProbe.sha256 !== resource.sha256) {
@@ -630,66 +638,170 @@ export function generateDataFactoryManifest(db: DatabaseSync): {
   };
 }
 
-function extractTextLinesFromContent(
-  rawText: string,
+function decodeHtmlAndXmlEntities(text: string): string {
+  const named: Record<string, string> = {
+    '&amp;': '&',
+    '&lt;': '<',
+    '&gt;': '>',
+    '&quot;': '"',
+    '&#39;': "'",
+    '&apos;': "'",
+    '&nbsp;': ' ',
+  };
+  return text
+    .replace(/&(amp|lt|gt|quot|apos|nbsp|#39);/gi, (m) => named[m.toLowerCase()] ?? m)
+    .replace(/&#(\d+);/g, (_m, dec) => {
+      const code = Number.parseInt(dec, 10);
+      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : ' ';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : ' ';
+    });
+}
+
+/**
+ * Full RFC-4180 CSV parser supporting quoted fields, escaped "" double quotes,
+ * embedded commas, and embedded multiline cells.
+ */
+function parseRfc4180Csv(csvText: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i++) {
+    const ch = csvText[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (csvText[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field.trim());
+      field = '';
+    } else if (ch === '\r') {
+      if (csvText[i + 1] === '\n') i += 1;
+      row.push(field.trim());
+      if (row.some((c) => c.length > 0)) rows.push(row);
+      row = [];
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field.trim());
+      if (row.some((c) => c.length > 0)) rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += ch;
+    }
+  }
+  row.push(field.trim());
+  if (row.some((c) => c.length > 0)) rows.push(row);
+  return rows;
+}
+
+function extractTextFromDocxBuffer(buf: Buffer): string[] {
+  const extracted = extractAndVerifyZipArchive(buf);
+  if (!extracted.validStructure) {
+    throw new Error(`Invalid DOCX ZIP archive: ${extracted.error || 'malformed package'}`);
+  }
+  const docEntry = extracted.entries.get('word/document.xml');
+  if (!docEntry) {
+    throw new Error('DOCX archive missing word/document.xml');
+  }
+  const xml = docEntry.content.toString('utf-8');
+  // Split paragraphs <w:p ...>...</w:p> and join <w:t> runs cleanly
+  const paragraphs = xml.split(/<\/w:p>/i);
+  const lines: string[] = [];
+  for (const para of paragraphs) {
+    const tMatches = para.match(/<w:t(?:\s+[^>]*)?>([\s\S]*?)<\/w:t>/gi) ?? [];
+    if (tMatches.length > 0) {
+      const joined = tMatches
+        .map((m) => decodeHtmlAndXmlEntities(m.replace(/<\/?w:t(?:\s+[^>]*)?>/gi, '')))
+        .join('')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (joined) lines.push(joined);
+    }
+  }
+  return lines;
+}
+
+function extractTextLinesFromBuffer(
+  fileBuf: Buffer,
   fileExt: string,
   stripHtml: boolean,
 ): string[] {
   const ext = fileExt.toLowerCase();
-  const segments: string[] = [];
+  if (ext === '.pdf' || (fileBuf.length >= 5 && fileBuf.subarray(0, 5).toString('ascii') === '%PDF-')) {
+    throw new Error(
+      'Native PDF binary parser (pdftotext/poppler) is not installed on this host. Convert PDF to .docx, .txt, or .jsonl prior to ingestion.',
+    );
+  }
 
-  if (ext === '.jsonl' || ext === '.ndjson') {
-    for (const line of rawText.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+  let segments: string[] = [];
+
+  if (ext === '.docx') {
+    segments = extractTextFromDocxBuffer(fileBuf);
+  } else {
+    const rawText = fileBuf.toString('utf-8');
+    if (ext === '.jsonl' || ext === '.ndjson') {
+      for (const line of rawText.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const obj = JSON.parse(trimmed) as Record<string, unknown>;
+          if (typeof obj === 'string') {
+            segments.push(obj);
+          } else if (obj && typeof obj === 'object') {
+            const textParts = ['text', 'prompt', 'instruction', 'input', 'question', 'answer', 'output', 'content', 'body']
+              .map((k) => (typeof obj[k] === 'string' ? (obj[k] as string).trim() : ''))
+              .filter(Boolean);
+            segments.push(textParts.length > 0 ? textParts.join(' | ') : JSON.stringify(obj));
+          }
+        } catch {
+          segments.push(trimmed);
+        }
+      }
+    } else if (ext === '.json') {
       try {
-        const obj = JSON.parse(trimmed) as Record<string, unknown>;
-        if (typeof obj === 'string') {
-          segments.push(obj);
-        } else if (obj && typeof obj === 'object') {
-          const textParts = ['text', 'prompt', 'instruction', 'input', 'question', 'answer', 'output', 'content', 'body']
-            .map((k) => (typeof obj[k] === 'string' ? (obj[k] as string).trim() : ''))
-            .filter(Boolean);
-          segments.push(textParts.length > 0 ? textParts.join(' | ') : JSON.stringify(obj));
+        const parsed = JSON.parse(rawText) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (typeof item === 'string') segments.push(item);
+            else if (item && typeof item === 'object') {
+              const rec = item as Record<string, unknown>;
+              const joined = Object.values(rec)
+                .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+                .join(' | ');
+              if (joined) segments.push(joined);
+            }
+          }
+        } else if (parsed && typeof parsed === 'object') {
+          const vals = Object.values(parsed as Record<string, unknown>)
+            .filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+          segments.push(...vals);
         }
       } catch {
-        segments.push(trimmed);
+        segments.push(...rawText.split(/\r?\n/));
       }
-    }
-  } else if (ext === '.json') {
-    try {
-      const parsed = JSON.parse(rawText) as unknown;
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (typeof item === 'string') segments.push(item);
-          else if (item && typeof item === 'object') {
-            const rec = item as Record<string, unknown>;
-            const joined = Object.values(rec)
-              .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-              .join(' | ');
-            if (joined) segments.push(joined);
-          }
-        }
-      } else if (parsed && typeof parsed === 'object') {
-        const vals = Object.values(parsed as Record<string, unknown>)
-          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
-        segments.push(...vals);
+    } else if (ext === '.csv') {
+      const parsedRows = parseRfc4180Csv(rawText);
+      for (const cols of parsedRows) {
+        const cleaned = cols.filter((c) => c.length > 0).join(' | ');
+        if (cleaned) segments.push(cleaned);
       }
-    } catch {
+    } else {
       segments.push(...rawText.split(/\r?\n/));
     }
-  } else if (ext === '.csv') {
-    const rows = rawText.split(/\r?\n/).filter((r) => r.trim().length > 0);
-    for (const row of rows) {
-      const cleaned = row
-        .split(',')
-        .map((c) => c.replace(/^"|"$/g, '').trim())
-        .filter(Boolean)
-        .join(' | ');
-      if (cleaned) segments.push(cleaned);
-    }
-  } else {
-    segments.push(...rawText.split(/\r?\n/));
   }
 
   return segments.map((line) => {
@@ -699,11 +811,13 @@ function extractTextLinesFromContent(
         .replace(/<script[\s\S]*?<\/script>/gi, ' ')
         .replace(/<style[\s\S]*?<\/style>/gi, ' ')
         .replace(/<[^>]+>/g, ' ');
+      normalized = decodeHtmlAndXmlEntities(normalized);
     }
     return normalized
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
       .replace(/\s+/g, ' ')
-      .trim();
+      .trim()
+      .normalize('NFC');
   });
 }
 
@@ -720,6 +834,8 @@ export function processAndBuildDatasetPackage(
     deduplicateLines?: boolean;
     minLineLength?: number;
     format?: 'JSONL' | 'TXT';
+    tokenizerPath?: string;
+    splitSeed?: string;
   },
 ): {
   resource: ResourceRecord;
@@ -728,6 +844,25 @@ export function processAndBuildDatasetPackage(
   dataFileSha256: string;
   manifestPath: string;
   manifestSha256: string;
+  splits: {
+    trainPath: string;
+    valPath: string;
+    testPath: string;
+    trainCount: number;
+    valCount: number;
+    testCount: number;
+  };
+  tokenStats: {
+    totalLines: number;
+    totalTokens: number;
+    avgTokensPerLine: number;
+    unkTokens: number;
+    unkRate: number;
+  };
+  qualityGate: {
+    readyForTraining: boolean;
+    checks: Array<{ name: string; passed: boolean; detail: string }>;
+  };
   stats: {
     inputSourcesCount: number;
     rawLinesCount: number;
@@ -774,7 +909,7 @@ export function processAndBuildDatasetPackage(
     }
     provenanceSources.push({ kind: 'LIBRARY_RESOURCE', ref: res.id, sha256: actualSha });
     rawExtracted.push(
-      ...extractTextLinesFromContent(rawBuf.toString('utf-8'), path.extname(res.filePath), stripHtml),
+      ...extractTextLinesFromBuffer(rawBuf, path.extname(res.filePath), stripHtml),
     );
   }
 
@@ -786,7 +921,7 @@ export function processAndBuildDatasetPackage(
     const sha = crypto.createHash('sha256').update(fileBuf).digest('hex');
     provenanceSources.push({ kind: 'UPLOADED_FILE', ref: file.fileName, sha256: sha });
     rawExtracted.push(
-      ...extractTextLinesFromContent(fileBuf.toString('utf-8'), path.extname(file.fileName), stripHtml),
+      ...extractTextLinesFromBuffer(fileBuf, path.extname(file.fileName), stripHtml),
     );
   }
 
@@ -830,8 +965,77 @@ export function processAndBuildDatasetPackage(
           .join('\n') + '\n';
 
   const outputBuf = Buffer.from(outputBody, 'utf-8');
-  fs.writeFileSync(dataFilePath, outputBuf);
+  writeFileAtomic(dataFilePath, outputBuf);
   const dataFileSha256 = crypto.createHash('sha256').update(outputBuf).digest('hex');
+
+  // Deterministic reproducible Train / Validation / Test split (80/10/10 by SHA-256 keyed order)
+  const splitSeed = input.splitSeed || `${datasetName}:${version}`;
+  const keyed = cleanedLines.map((line, index) => ({
+    line,
+    sortKey: crypto.createHash('sha256').update(`${splitSeed}:${index}:${line}`).digest('hex'),
+  }));
+  keyed.sort((a, b) => (a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0));
+
+  const trainLines: string[] = [];
+  const valLines: string[] = [];
+  const testLines: string[] = [];
+
+  if (keyed.length < 3) {
+    trainLines.push(...keyed.map((k) => k.line));
+  } else {
+    const valCountTarget = Math.max(1, Math.floor(keyed.length * 0.1));
+    const testCountTarget = Math.max(1, Math.floor(keyed.length * 0.1));
+    const trainCountTarget = Math.max(1, keyed.length - valCountTarget - testCountTarget);
+    for (let i = 0; i < keyed.length; i++) {
+      if (i < trainCountTarget) trainLines.push(keyed[i].line);
+      else if (i < trainCountTarget + valCountTarget) valLines.push(keyed[i].line);
+      else testLines.push(keyed[i].line);
+    }
+  }
+
+  const splitsDir = path.join(packageDir, 'splits');
+  fs.mkdirSync(splitsDir, { recursive: true });
+  const serializeJsonl = (arr: string[]) =>
+    arr.map((text, idx) => JSON.stringify({ id: idx + 1, text })).join('\n') + (arr.length ? '\n' : '');
+
+  const trainPath = path.join(splitsDir, 'train.jsonl');
+  const valPath = path.join(splitsDir, 'val.jsonl');
+  const testPath = path.join(splitsDir, 'test.jsonl');
+  writeFileAtomic(trainPath, serializeJsonl(trainLines), 'utf-8');
+  writeFileAtomic(valPath, serializeJsonl(valLines), 'utf-8');
+  writeFileAtomic(testPath, serializeJsonl(testLines), 'utf-8');
+
+  // Tokenize cleaned corpus for quality gate metrics
+  const tokenizer =
+    input.tokenizerPath && fs.existsSync(input.tokenizerPath)
+      ? loadTokenizerFile(input.tokenizerPath)
+      : trainTokenizerFromCorpus(cleanedLines, { spec: 'DATASET-AUDIT-BPE-V1', targetMerges: 48 });
+  const tokenStats = tokenizeDatasetLines(tokenizer, cleanedLines);
+
+  const disallowedLicenses = new Set(['', 'UNKNOWN', 'NONE', 'UNLICENSED', 'N/A']);
+  const qualityChecks = [
+    {
+      name: 'NON_EMPTY_CLEAN_SAMPLES',
+      passed: cleanedLines.length >= 1,
+      detail: `${cleanedLines.length} cleaned lines retained`,
+    },
+    {
+      name: 'LICENSE_DECLARED',
+      passed: !disallowedLicenses.has(license.toUpperCase()),
+      detail: `License: ${license}`,
+    },
+    {
+      name: 'TOKENIZATION_UNK_RATE_ACCEPTABLE',
+      passed: tokenStats.unkRate <= 0.05 && tokenStats.totalTokens > 0,
+      detail: `Total tokens=${tokenStats.totalTokens}, UNK rate=${tokenStats.unkRate}`,
+    },
+    {
+      name: 'SPLITS_MATERIALIZED',
+      passed: fs.existsSync(trainPath) && trainLines.length >= 1,
+      detail: `train=${trainLines.length}, val=${valLines.length}, test=${testLines.length}`,
+    },
+  ];
+  const readyForTraining = qualityChecks.every((c) => c.passed);
 
   const manifestObj = {
     factory: 'NG-ILMF DATA FACTORY',
@@ -843,6 +1047,19 @@ export function processAndBuildDatasetPackage(
     dataFile: path.basename(dataFilePath),
     dataFileSha256,
     outputBytes: outputBuf.length,
+    splits: {
+      trainPath,
+      valPath,
+      testPath,
+      trainCount: trainLines.length,
+      valCount: valLines.length,
+      testCount: testLines.length,
+    },
+    tokenStats,
+    qualityGate: {
+      readyForTraining,
+      checks: qualityChecks,
+    },
     stats: {
       inputSourcesCount: provenanceSources.length,
       rawLinesCount: rawExtracted.length,
@@ -857,7 +1074,7 @@ export function processAndBuildDatasetPackage(
 
   const manifestPath = path.join(packageDir, 'DATASET_MANIFEST.json');
   const manifestJson = JSON.stringify(manifestObj, null, 2);
-  fs.writeFileSync(manifestPath, manifestJson, 'utf-8');
+  writeFileAtomic(manifestPath, manifestJson, 'utf-8');
   const manifestSha256 = crypto.createHash('sha256').update(manifestJson, 'utf-8').digest('hex');
 
   const registered = registerResource(db, {
@@ -876,12 +1093,14 @@ export function processAndBuildDatasetPackage(
     category: 'DATA_FACTORY',
     action: 'BUILD_CLEANED_DATASET_PACKAGE',
     target: `${registered.resource.id} (${dataFilePath})`,
-    outcome: 'PASS',
+    outcome: readyForTraining ? 'PASS' : 'WARNING',
     details: {
       dataFileSha256,
       manifestSha256,
       cleanedLinesCount: cleanedLines.length,
       deduplicatedCount,
+      totalTokens: tokenStats.totalTokens,
+      readyForTraining,
     },
   });
 
@@ -892,6 +1111,9 @@ export function processAndBuildDatasetPackage(
     dataFileSha256,
     manifestPath,
     manifestSha256,
+    splits: manifestObj.splits,
+    tokenStats,
+    qualityGate: manifestObj.qualityGate,
     stats: manifestObj.stats,
   };
 }

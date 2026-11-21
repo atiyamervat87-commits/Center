@@ -6,6 +6,7 @@ import type { Request, Response } from 'express';
 import { getDefaultRuntimeConfig } from '../config/runtime.ts';
 import { getConfigMap } from '../db/database.ts';
 import {
+  buildWorkerAuthHeaders,
   listTrainingJobs,
   listWorkers,
   recordJobTelemetry,
@@ -14,6 +15,7 @@ import {
 } from './mindFactoryService.ts';
 import { getMasterDashboardSnapshot } from './dashboardService.ts';
 import type { SystemState } from './dashboardService.ts';
+import { assertWorkerUrlSafeBeforeFetch } from '../utils/urlSecurity.ts';
 
 export interface PerformanceMetricsSnapshot {
   collectedAt: string;
@@ -167,8 +169,9 @@ interface WorkerMetricsPayload {
 }
 
 /**
- * Probes registered ONLINE workers' real HTTP `/health` and `/metrics` endpoints.
- * Never fabricates progress; only writes telemetry genuinely returned by the worker.
+ * Probes ALL registered workers' real HTTP `/health` and `/metrics` endpoints
+ * (so previously OFFLINE workers recover back to ONLINE when reachable)
+ * with SSRF validation and mutual-auth headers. Never fabricates progress.
  */
 export async function syncOnlineWorkersTelemetry(db: DatabaseSync): Promise<{
   probedWorkers: number;
@@ -177,26 +180,23 @@ export async function syncOnlineWorkersTelemetry(db: DatabaseSync): Promise<{
 }> {
   const workers = listWorkers(db);
   const config = getConfigMap(db);
-  const activeWorkers = workers.filter(
-    (w) => w.status === 'ONLINE' || w.status === 'WARNING',
-  );
 
   let updatedJobs = 0;
   let onlineCount = 0;
 
-  for (const worker of activeWorkers) {
-    const base = worker.endpointUrl.endsWith('/')
-      ? worker.endpointUrl.slice(0, -1)
-      : worker.endpointUrl;
+  for (const worker of workers) {
     const now = new Date().toISOString();
-
+    let safeBase = '';
     let nextStatus: SystemState = worker.status;
     let reachable = false;
+
     try {
+      safeBase = await assertWorkerUrlSafeBeforeFetch(worker.endpointUrl);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 1500);
-      const healthRes = await fetch(`${base}/health`, {
+      const healthRes = await fetch(`${safeBase}/health`, {
         method: 'GET',
+        headers: buildWorkerAuthHeaders(db, worker.id, ''),
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -207,7 +207,7 @@ export async function syncOnlineWorkersTelemetry(db: DatabaseSync): Promise<{
       nextStatus = 'OFFLINE';
     }
 
-    if (reachable) {
+    if (reachable && safeBase) {
       onlineCount += 1;
       db.prepare(
         'UPDATE training_workers SET status = ?, last_heartbeat_at = ?, updated_at = ? WHERE id = ?',
@@ -217,8 +217,9 @@ export async function syncOnlineWorkersTelemetry(db: DatabaseSync): Promise<{
       try {
         const metricsController = new AbortController();
         const metricsTimer = setTimeout(() => metricsController.abort(), 1500);
-        const metricsRes = await fetch(`${base}/metrics`, {
+        const metricsRes = await fetch(`${safeBase}/metrics`, {
           method: 'GET',
+          headers: buildWorkerAuthHeaders(db, worker.id, ''),
           signal: metricsController.signal,
         });
         clearTimeout(metricsTimer);
@@ -254,11 +255,10 @@ export async function syncOnlineWorkersTelemetry(db: DatabaseSync): Promise<{
     }
   }
 
-  // Also ensure configured default bridge endpoint status stays fresh if workers == 0
   void config;
 
   return {
-    probedWorkers: activeWorkers.length,
+    probedWorkers: workers.length,
     onlineWorkers: onlineCount,
     updatedJobs,
   };

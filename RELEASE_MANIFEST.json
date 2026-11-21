@@ -1,0 +1,153 @@
+{
+  "manifestVersion": "1.0.0",
+  "project": "NG-ILMF Mobile Command Center",
+  "identity": "Future Generations Intelligent Minds Factory (Independent Constitutional Architecture)",
+  "generatedAt": "2026-11-20T21:47:41Z",
+  "constitutionalWings": [
+    "MASTER CONTROL & QUALITY CENTER",
+    "DATA FACTORY",
+    "NEW MIND FACTORY",
+    "MIND REPAIR & RE-ENGINEERING FACTORY",
+    "TRUST & SECURITY CENTER",
+    "NG-IP SERVICES"
+  ],
+  "verificationSummary": {
+    "typescriptTypecheck": {
+      "command": "npm run lint",
+      "status": "PASS",
+      "exitCode": 0
+    },
+    "frontendBuild": {
+      "command": "npm run build",
+      "status": "PASS",
+      "exitCode": 0
+    },
+    "automatedTestSuite": {
+      "command": "npm test",
+      "status": "PASS",
+      "totalTests": 30,
+      "passed": 30,
+      "failed": 0
+    },
+    "liveServerBootCheck": {
+      "status": "PASS",
+      "health": "ONLINE (SQLite WAL)",
+      "configSecretsRedacted": true,
+      "preLockPostProjectsHttpStatus": 403
+    },
+    "androidApkBuild": {
+      "status": "BLOCKED",
+      "reason": "Container lacks JDK (java/javac), Gradle/gradle-wrapper.jar, and Android SDK; android/ build files and Kotlin bridge audited statically only."
+    },
+    "realDeviceSafValidation": {
+      "status": "BLOCKED",
+      "reason": "No adb binary or physical Android OPPO device attached to Linux host environment."
+    },
+    "nativePdfParser": {
+      "status": "BLOCKED",
+      "reason": "pdftotext/poppler unavailable in host container; PDF ingestion fails closed with explicit operator guidance."
+    }
+  },
+  "artifacts": {
+    "server.ts": {
+      "sizeBytes": 3455,
+      "sha256": "2a78579ce4d8212ddabcb1b454c4dc952c5e1cb55b12ce0b623546ac718a2aa3"
+    },
+    "package.json": {
+      "sizeBytes": 937,
+      "sha256": "994a07ba461f974b74be47ba57a9e78374f8b3f4b5c2d5001f429d55ecd01619"
+    },
+    "server/routes/api.ts": {
+      "sizeBytes": 51929,
+      "sha256": "6f4a3d2a707e6708a90b5856ac4159fb7e0799e98b2a225f4bd30b4286b65521"
+    },
+    "server/utils/fsAtomic.ts": {
+      "sizeBytes": 3998,
+      "sha256": "55173f02790647c7775c0a8c6023bd9239d11dd08b27141178259d7019b04c84"
+    },
+    "server/utils/urlSecurity.ts": {
+      "sizeBytes": 9294,
+      "sha256": "5923ade34d24a66004b6b33fd21f0a55a6319fffc4858114b0156e9f9e55f98f"
+    },
+    "server/utils/zipBuilder.ts": {
+      "sizeBytes": 9006,
+      "sha256": "9f0365adec36afce472e11f91e0cfc02247677a057e61f19bd31eb60622eceac"
+    },
+    "server/services/securityService.ts": {
+      "sizeBytes": 18005,
+      "sha256": "1aa38633a8b9730ba8cbe12afffa84ffcf5a5fc2df05b3857c8c5a165935e0c0"
+    },
+    "server/services/deviceManagerService.ts": {
+      "sizeBytes": 10909,
+      "sha256": "1f99ed53b276e47ac3b20b67168a42ffb513235d8092704d96022bb2d5e17ce6"
+    },
+    "server/services/dashboardService.ts": {
+      "sizeBytes": 16240,
+      "sha256": "f43cd28993370d126ee7acb42021bafcf80fbee4d44b672b196a8c9d360b3b6c"
+    },
+    "server/services/dataFactoryService.ts": {
+      "sizeBytes": 43802,
+      "sha256": "493b4eb48be93567b0e831383899d6257908445d187a6b34d6dc7f3a1c3858c3"
+    },
+    "server/services/mindFactoryService.ts": {
+      "sizeBytes": 56274,
+      "sha256": "6d21e16ec316a4405e0fd399bb2f5f68c65a1ffedcf8ef73a1b2f4d2d44c74ff"
+    },
+    "server/services/realtimeSyncService.ts": {
+      "sizeBytes": 12697,
+      "sha256": "2e07d8757efd96e2153e2e54e6ea3ec23a6c695a8a0ab42d9ed521596b2cf2cf"
+    },
+    "server/services/repairRegistryService.ts": {
+      "sizeBytes": 29209,
+      "sha256": "ce544fecd347aeb6460587b8e0c95f4444f3c5f60297f63ed97834b3f3094313"
+    },
+    "server/services/trustQcService.ts": {
+      "sizeBytes": 15247,
+      "sha256": "7877f13a52d2d826d4aded749998c815d1a70a5b127bbf2473bde0e2d4332029"
+    },
+    "server/services/ngIpService.ts": {
+      "sizeBytes": 17500,
+      "sha256": "ddcdc0c5f22eba682806ae1f721b04b33c5ce346864eeb701f4690fb30dfd124"
+    },
+    "server/storage/storageProvider.ts": {
+      "sizeBytes": 21126,
+      "sha256": "5a92b6a39fdd03a90ebdda611307f6e896cbfd8ed399b09f418a9ed1fbcef2ff"
+    },
+    "server/storage/androidBridgeDiagnostic.ts": {
+      "sizeBytes": 12184,
+      "sha256": "e93ff884cb34f904b51b1cd68e768c64015e5864b41f5824be5c24969b90b273"
+    },
+    "server/ml/tokenizerEngine.ts": {
+      "sizeBytes": 9596,
+      "sha256": "7c09de48e37504f7c07918eab641b67a1af4210b5a5754f415ddd466d161516e"
+    },
+    "server/ml/neuralMindEngine.ts": {
+      "sizeBytes": 27867,
+      "sha256": "2260086f3a627d34d71d5759bcca87ee5033bb4a09e260be9f69adee250e26d3"
+    },
+    "src/bridge/androidBridge.ts": {
+      "sizeBytes": 7766,
+      "sha256": "159f02cddc10d64c191b2f1a0772bf1a66e560ea4f2c609856608d7c1682252a"
+    },
+    "src/services/apiClient.ts": {
+      "sizeBytes": 21657,
+      "sha256": "4ce3e0dbd96b5927e5d2702fe8a9cda4d9da5c1a429ba0f973a970318dc228c2"
+    },
+    "android/app/src/main/AndroidManifest.xml": {
+      "sizeBytes": 1032,
+      "sha256": "854082b9094ce5ac38893fabc4c252b0a2f60e14ec7d1a699c6d788faaa81144"
+    },
+    "android/app/src/main/java/com/ngilmf/commandcenter/MainActivity.kt": {
+      "sizeBytes": 10770,
+      "sha256": "7bcf39e435a0c27b52f9f65dca989c6e488556d52d781f977f08bdedef6ea92e"
+    },
+    "android/app/src/main/java/com/ngilmf/commandcenter/SafStorageBridge.kt": {
+      "sizeBytes": 15461,
+      "sha256": "e3c5d5884527a5812c0df3b4cd3f961d2c12118b7031a6ab56e629e39cc9fbb8"
+    },
+    "dist/index.html": {
+      "sizeBytes": 1436,
+      "sha256": "5a17de9e1e9aae23d1d49a65cf3510b3279a4536a001f01625017ebd0b568850"
+    }
+  }
+}

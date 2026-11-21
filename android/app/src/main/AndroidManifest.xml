@@ -12,7 +12,7 @@
         android:allowBackup="false"
         android:label="NG-ILMF Command Center"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
         <activity

@@ -6,6 +6,16 @@ export interface ZipInputFile {
   content: Buffer | string;
 }
 
+export interface VerifiedZipEntry {
+  name: string;
+  content: Buffer;
+  sizeBytes: number;
+  sha256: string;
+  crc32: number;
+  method: number;
+  crc32Valid: boolean;
+}
+
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -18,7 +28,7 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-function crc32(buf: Buffer): number {
+export function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
   for (let i = 0; i < buf.length; i++) {
     crc = CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
@@ -58,7 +68,7 @@ export function buildZipArchive(files: ZipInputFile[]): {
     const useDeflate = compressed.length < rawBuf.length;
     const method = useDeflate ? 8 : 0;
     const payload = useDeflate ? compressed : rawBuf;
-    const crc = crc32(rawBuf);
+    const checksum = crc32(rawBuf);
 
     // Local File Header (30 bytes + filename)
     const localHeader = Buffer.alloc(30 + nameBuf.length);
@@ -68,7 +78,7 @@ export function buildZipArchive(files: ZipInputFile[]): {
     localHeader.writeUInt16LE(method, 8);
     localHeader.writeUInt16LE(dosTime, 10);
     localHeader.writeUInt16LE(dosDate, 12);
-    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(checksum, 14);
     localHeader.writeUInt32LE(payload.length, 18);
     localHeader.writeUInt32LE(rawBuf.length, 22);
     localHeader.writeUInt16LE(nameBuf.length, 26);
@@ -86,7 +96,7 @@ export function buildZipArchive(files: ZipInputFile[]): {
     centralHeader.writeUInt16LE(method, 10);
     centralHeader.writeUInt16LE(dosTime, 12);
     centralHeader.writeUInt16LE(dosDate, 14);
-    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(checksum, 16);
     centralHeader.writeUInt32LE(payload.length, 20);
     centralHeader.writeUInt32LE(rawBuf.length, 24);
     centralHeader.writeUInt16LE(nameBuf.length, 28);
@@ -116,4 +126,122 @@ export function buildZipArchive(files: ZipInputFile[]): {
   const buffer = Buffer.concat([...localChunks, ...centralChunks, eocd]);
   const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
   return { buffer, sha256 };
+}
+
+/**
+ * Parses Central Directory and Local File Headers of a PKZIP buffer, decompresses every
+ * entry, verifies CRC-32 checksums, and computes per-entry SHA-256 digests.
+ */
+export function extractAndVerifyZipArchive(zipBuffer: Buffer): {
+  validStructure: boolean;
+  entryCount: number;
+  allCrcValid: boolean;
+  entries: Map<string, VerifiedZipEntry>;
+  error?: string;
+} {
+  const empty = new Map<string, VerifiedZipEntry>();
+  if (zipBuffer.length < 22) {
+    return { validStructure: false, entryCount: 0, allCrcValid: false, entries: empty, error: 'Archive too small for EOCD' };
+  }
+
+  // Locate EOCD signature 0x06054b50 backwards
+  let eocdOffset = -1;
+  const minSearch = Math.max(0, zipBuffer.length - 65558);
+  for (let i = zipBuffer.length - 22; i >= minSearch; i--) {
+    if (zipBuffer.readUInt32LE(i) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset === -1) {
+    return { validStructure: false, entryCount: 0, allCrcValid: false, entries: empty, error: 'PKZIP End of Central Directory not found' };
+  }
+
+  const totalEntries = zipBuffer.readUInt16LE(eocdOffset + 10);
+  const centralDirSize = zipBuffer.readUInt32LE(eocdOffset + 12);
+  const centralDirOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
+  if (centralDirOffset + centralDirSize > eocdOffset) {
+    return { validStructure: false, entryCount: 0, allCrcValid: false, entries: empty, error: 'Corrupted Central Directory bounds' };
+  }
+
+  const entries = new Map<string, VerifiedZipEntry>();
+  let cursor = centralDirOffset;
+  let allCrcValid = true;
+
+  for (let idx = 0; idx < totalEntries; idx++) {
+    if (cursor + 46 > eocdOffset || zipBuffer.readUInt32LE(cursor) !== 0x02014b50) {
+      return { validStructure: false, entryCount: entries.size, allCrcValid: false, entries, error: `Invalid Central Directory entry at #${idx}` };
+    }
+
+    const method = zipBuffer.readUInt16LE(cursor + 10);
+    const expectedCrc = zipBuffer.readUInt32LE(cursor + 16);
+    const compSize = zipBuffer.readUInt32LE(cursor + 20);
+    const uncompSize = zipBuffer.readUInt32LE(cursor + 24);
+    const nameLen = zipBuffer.readUInt16LE(cursor + 28);
+    const extraLen = zipBuffer.readUInt16LE(cursor + 30);
+    const commentLen = zipBuffer.readUInt16LE(cursor + 32);
+    const localOffset = zipBuffer.readUInt32LE(cursor + 42);
+
+    const entryName = zipBuffer.subarray(cursor + 46, cursor + 46 + nameLen).toString('utf-8');
+    cursor += 46 + nameLen + extraLen + commentLen;
+
+    // Prevent ZipSlip traversal inside parsed entry paths
+    if (entryName.startsWith('/') || entryName.includes('..')) {
+      return { validStructure: false, entryCount: entries.size, allCrcValid: false, entries, error: `Unsafe zip entry path blocked: ${entryName}` };
+    }
+
+    if (localOffset + 30 > centralDirOffset || zipBuffer.readUInt32LE(localOffset) !== 0x04034b50) {
+      return { validStructure: false, entryCount: entries.size, allCrcValid: false, entries, error: `Invalid local file header for ${entryName}` };
+    }
+
+    const localNameLen = zipBuffer.readUInt16LE(localOffset + 26);
+    const localExtraLen = zipBuffer.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+    const dataEnd = dataStart + compSize;
+    if (dataEnd > centralDirOffset) {
+      return { validStructure: false, entryCount: entries.size, allCrcValid: false, entries, error: `Truncated compressed payload for ${entryName}` };
+    }
+
+    const compressedSlice = zipBuffer.subarray(dataStart, dataEnd);
+    let content: Buffer;
+    try {
+      if (method === 0) {
+        content = Buffer.from(compressedSlice);
+      } else if (method === 8) {
+        content = zlib.inflateRawSync(compressedSlice);
+      } else {
+        return { validStructure: false, entryCount: entries.size, allCrcValid: false, entries, error: `Unsupported compression method ${method} for ${entryName}` };
+      }
+    } catch (err) {
+      return {
+        validStructure: false,
+        entryCount: entries.size,
+        allCrcValid: false,
+        entries,
+        error: `Decompression failed for ${entryName}: ${err instanceof Error ? err.message : 'corrupt stream'}`,
+      };
+    }
+
+    const actualCrc = crc32(content);
+    const crcValid = actualCrc === expectedCrc && content.length === uncompSize;
+    if (!crcValid) allCrcValid = false;
+
+    const sha256 = crypto.createHash('sha256').update(content).digest('hex');
+    entries.set(entryName, {
+      name: entryName,
+      content,
+      sizeBytes: content.length,
+      sha256,
+      crc32: actualCrc,
+      method,
+      crc32Valid: crcValid,
+    });
+  }
+
+  return {
+    validStructure: true,
+    entryCount: entries.size,
+    allCrcValid,
+    entries,
+  };
 }

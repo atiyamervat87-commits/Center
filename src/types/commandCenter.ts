@@ -461,9 +461,12 @@ export interface SecurityPermissions {
   pairingRequiresAuth: boolean;
 }
 
+export type SessionRole = 'OWNER' | 'OPERATOR' | 'VIEWER';
+
 export interface OwnerSessionRecord {
   id: string;
   deviceLabel: string;
+  role?: SessionRole;
   expiresAt: string;
   revoked: boolean;
   createdAt: string;
@@ -472,8 +475,10 @@ export interface OwnerSessionRecord {
 
 export interface SecuritySnapshot {
   ownerLockConfigured: boolean;
+  bootstrapTokenRequired?: boolean;
   sessionAuthenticated: boolean;
   activeSessionId: string | null;
+  activeRole?: SessionRole | null;
   permissions: SecurityPermissions;
   sessions: OwnerSessionRecord[];
 }
